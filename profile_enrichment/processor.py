@@ -144,7 +144,13 @@ def sanitize_extracted(extracted: Dict[str, Any]) -> Dict[str, Any]:
     return cleaned
 
 
+_no_useful_information_count = 0
+
+
 def _log_no_useful_information(profile_id: str, reason: str) -> None:
+    """Logged to the file only; the terminal gets the run-end count instead."""
+    global _no_useful_information_count
+    _no_useful_information_count += 1
     logger.info("NO_USEFUL_INFORMATION | profile_id=%s | reason=%s", profile_id, reason)
 
 
@@ -309,6 +315,9 @@ def run_enrichment(
     else:
         raise ValueError(f"Unsupported source: {source_name}")
 
+    global _no_useful_information_count
+    _no_useful_information_count = 0
+
     total_rows = 0
     processed = 0
     skipped = 0
@@ -346,6 +355,7 @@ def run_enrichment(
         "total_rows": total_rows,
         "processed": processed,
         "skipped": skipped,
+        "no_text_extracted": _no_useful_information_count,
         "state_file": str(state.state_path),
     }
 
@@ -360,7 +370,16 @@ if __name__ == "__main__":
     parser.add_argument("--no-skip-processed", action="store_true", help="Process rows even if they were already marked as processed.")
     parser.add_argument("--comprehensive", action="store_true", help="Reprocess entire row: extract all fields and cross-verify with existing data.")
     parser.add_argument("--no-ocr", action="store_true", help="Disable OCR (Tesseract) and use only native text and AI extraction.")
+    parser.add_argument("--verbose", action="store_true", help="Show per-profile diagnostic lines that are normally file-only.")
     args = parser.parse_args()
+
+    if args.verbose:
+        from profile_enrichment.logging_utils import ConsoleNoiseFilter
+
+        for handler in logger.handlers:
+            for log_filter in list(handler.filters):
+                if isinstance(log_filter, ConsoleNoiseFilter):
+                    handler.removeFilter(log_filter)
 
     if args.no_skip_processed:
         CONFIG["skip_already_processed"] = False

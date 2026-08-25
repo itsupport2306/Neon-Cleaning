@@ -3,3 +3,7 @@ Traceback (most recent call last):
   File "<string>", line 5, in <module>
 PermissionError: [WinError 5] Access is denied
 2026-08-25 23:04:54 | WARNING | OCR_DISABLED | reason=tesseract not runnable ([WinError 5] Access is denied) | continuing with native text only
+2026-08-25 23:15:36 | INFO | NO_USEFUL_INFORMATION | profile_id=x | reason=no text
+2026-08-25 23:15:36 | INFO | START_PROCESSING | profile_id=x
+2026-08-25 23:15:46 | WARNING | VISION_OCR_DISABLED | reason=APIConnectionError: Connection error.
+2026-08-25 23:15:50 | WARNING | TESSERACT_DISABLED | reason=tesseract not runnable (tesseract is not installed or it's not in your PATH. See README file for more information.)

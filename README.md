@@ -53,10 +53,19 @@ The workflow is:
 pip install -r requirements.txt
 ```
 
-Optional OCR support:
+OCR support (scanned/image-only resumes):
 
-- Install Tesseract on your machine.
-- Set `TESSERACT_CMD` if your installation is not on the default PATH.
+OCR runs the **Qwen vision model first** and falls back to Tesseract.
+
+- Qwen: serve a Qwen *vision* model (e.g. `Qwen/Qwen2.5-VL-7B-Instruct` via vLLM/llama.cpp/Ollama)
+  behind an OpenAI-compatible endpoint and set `VISION_OCR_BASE_URL` (and `VISION_OCR_MODEL`).
+  If unset, it reuses `LOCAL_MODEL_BASE_URL` — note the default `Qwen2.5-1.5B-Instruct` there is
+  text-only and cannot do OCR, so point `VISION_OCR_BASE_URL` at a VL server.
+- Tesseract: install it and set `TESSERACT_CMD` if it is not on `PATH`.
+
+If an engine is unusable, it is disabled once with a single warning and the run continues.
+OCR is skipped entirely when a document already yields enough native text
+(`OCR_SKIP_WHEN_NATIVE_TEXT=false` to always OCR).
 
 ## Environment variables
 

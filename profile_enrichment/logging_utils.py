@@ -26,6 +26,25 @@ class ConsoleFormatter(logging.Formatter):
             record.exc_info, record.exc_text, record.stack_info = saved_exc_info, saved_exc_text, saved_stack
 
 
+# Events that are useful in the log file but only add noise to the terminal.
+CONSOLE_SUPPRESSED_EVENTS = ("NO_USEFUL_INFORMATION",)
+
+
+class ConsoleNoiseFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        message = str(record.msg)
+        return not any(event in message for event in CONSOLE_SUPPRESSED_EVENTS)
+
+
+def _quiet_third_party_loggers() -> None:
+    """Stop pypdf/pdfminer/httpx from writing parser warnings straight to stderr."""
+    for name in ("pypdf", "pypdf._reader", "pdfminer", "PIL", "httpx", "openai"):
+        third_party = logging.getLogger(name)
+        third_party.setLevel(logging.ERROR)
+        third_party.propagate = False
+        third_party.addHandler(logging.NullHandler())
+
+
 def setup_logger() -> logging.Logger:
     log_dir = Path(CONFIG["log_dir"])
     log_dir.mkdir(parents=True, exist_ok=True)
@@ -54,6 +73,9 @@ def setup_logger() -> logging.Logger:
             datefmt="%Y-%m-%d %H:%M:%S",
         )
     )
+    stream_handler.addFilter(ConsoleNoiseFilter())
+
+    _quiet_third_party_loggers()
 
     logger.addHandler(file_handler)
     logger.addHandler(stream_handler)

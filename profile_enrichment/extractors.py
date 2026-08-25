@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import io
 import json
 import logging
@@ -21,7 +22,8 @@ def normalize_text(value: Optional[str]) -> str:
     return " ".join(str(value).strip().split())
 
 
-_OCR_UNAVAILABLE_REASON: Optional[str] = None
+_TESSERACT_UNAVAILABLE_REASON: Optional[str] = None
+_VISION_UNAVAILABLE_REASON: Optional[str] = None
 
 
 def _configure_tesseract() -> None:
@@ -31,16 +33,122 @@ def _configure_tesseract() -> None:
         pytesseract.pytesseract.tesseract_cmd = CONFIG["tesseract_cmd"]
 
 
-def _disable_ocr(reason: str) -> None:
-    """Remember that the OCR engine is unusable so we stop retrying it per file."""
-    global _OCR_UNAVAILABLE_REASON
-    if _OCR_UNAVAILABLE_REASON is None:
-        _OCR_UNAVAILABLE_REASON = reason
-        logger.warning("OCR_DISABLED | reason=%s | continuing with native text only", reason)
+def _disable_tesseract(reason: str) -> None:
+    """Remember that Tesseract is unusable so we stop retrying it for every page."""
+    global _TESSERACT_UNAVAILABLE_REASON
+    if _TESSERACT_UNAVAILABLE_REASON is None:
+        _TESSERACT_UNAVAILABLE_REASON = reason
+        logger.warning("TESSERACT_DISABLED | reason=%s", reason)
+
+
+def _disable_vision_ocr(reason: str) -> None:
+    """Remember that the Qwen vision endpoint is unusable for the rest of the run."""
+    global _VISION_UNAVAILABLE_REASON
+    if _VISION_UNAVAILABLE_REASON is None:
+        _VISION_UNAVAILABLE_REASON = reason
+        logger.warning("VISION_OCR_DISABLED | reason=%s", reason)
+
+
+def _vision_ocr_base_url() -> Optional[str]:
+    return CONFIG["vision_ocr_base_url"] or CONFIG["local_model_base_url"]
+
+
+def _image_to_data_uri(image: Image.Image) -> str:
+    rgb_image = image.convert("RGB")
+    max_side = CONFIG["vision_ocr_max_image_side"]
+    if max_side and max(rgb_image.size) > max_side:
+        ratio = max_side / max(rgb_image.size)
+        new_size = (max(1, int(rgb_image.width * ratio)), max(1, int(rgb_image.height * ratio)))
+        rgb_image = rgb_image.resize(new_size)
+
+    buffer = io.BytesIO()
+    rgb_image.save(buffer, format="PNG", optimize=True)
+    return "data:image/png;base64," + base64.b64encode(buffer.getvalue()).decode("ascii")
+
+
+def _qwen_vision_ocr(image: Image.Image) -> str:
+    """Transcribe an image with the Qwen vision model. Returns "" when unavailable."""
+    if not CONFIG["vision_ocr_enabled"] or _VISION_UNAVAILABLE_REASON is not None:
+        return ""
+
+    base_url = _vision_ocr_base_url()
+    if not base_url:
+        _disable_vision_ocr("no VISION_OCR_BASE_URL / LOCAL_MODEL_BASE_URL configured")
+        return ""
+
+    try:
+        from openai import OpenAI
+
+        client = OpenAI(
+            base_url=base_url.rstrip("/") + "/",
+            api_key=CONFIG["vision_ocr_api_key"] or CONFIG["local_model_api_key"] or "local-qwen",
+            timeout=CONFIG["vision_ocr_timeout"],
+        )
+        response = client.chat.completions.create(
+            model=CONFIG["vision_ocr_model"],
+            messages=[
+                {
+                    "role": "system",
+                    "content": "You are an OCR engine. Transcribe the page verbatim as plain text. No commentary.",
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": (
+                                "Transcribe every piece of text in this resume page, preserving reading order. "
+                                "Include names, phone numbers, emails, addresses and headings. "
+                                "If the page has no text, reply with an empty response."
+                            ),
+                        },
+                        {"type": "image_url", "image_url": {"url": _image_to_data_uri(image)}},
+                    ],
+                },
+            ],
+            temperature=0,
+            max_tokens=CONFIG["vision_ocr_max_tokens"],
+        )
+    except Exception as exc:
+        _disable_vision_ocr(f"{type(exc).__name__}: {exc}")
+        return ""
+
+    return response.choices[0].message.content or ""
+
+
+def _tesseract_ocr(image: Image.Image) -> str:
+    if not CONFIG["ocr_enabled"] or _TESSERACT_UNAVAILABLE_REASON is not None:
+        return ""
+
+    try:
+        import pytesseract
+
+        _configure_tesseract()
+        return pytesseract.image_to_string(image.convert("RGB"))
+    except (PermissionError, FileNotFoundError, OSError) as exc:
+        _disable_tesseract(f"tesseract not runnable ({exc})")
+        return ""
+    except Exception as exc:
+        if "TesseractNotFound" in type(exc).__name__:
+            _disable_tesseract("tesseract binary not found")
+        else:
+            logger.debug("TESSERACT_PAGE_SKIPPED | %s: %s", type(exc).__name__, exc)
+        return ""
+
+
+def _needs_ocr(native_text: str) -> bool:
+    """Skip OCR when the document already yielded enough native text."""
+    if not CONFIG["ocr_skip_when_native_text"]:
+        return True
+    return not has_meaningful_text(native_text)
 
 
 def _ocr_is_available() -> bool:
-    return _OCR_UNAVAILABLE_REASON is None
+    vision_possible = (
+        CONFIG["vision_ocr_enabled"] and _VISION_UNAVAILABLE_REASON is None and bool(_vision_ocr_base_url())
+    )
+    tesseract_possible = CONFIG["ocr_enabled"] and _TESSERACT_UNAVAILABLE_REASON is None
+    return vision_possible or tesseract_possible
 
 
 def _safe_ocr(func, *args) -> str:
@@ -49,15 +157,8 @@ def _safe_ocr(func, *args) -> str:
         return ""
     try:
         return func(*args)
-    except (PermissionError, FileNotFoundError, OSError) as exc:
-        _disable_ocr(f"tesseract not runnable ({exc})")
-        return ""
     except Exception as exc:
-        message = type(exc).__name__
-        if "TesseractNotFound" in message:
-            _disable_ocr("tesseract binary not found")
-        else:
-            logger.debug("OCR_SKIPPED | %s: %s", message, exc)
+        logger.debug("OCR_SKIPPED | %s: %s", type(exc).__name__, exc)
         return ""
 
 
@@ -145,11 +246,11 @@ def _read_text_file(path: str) -> str:
 
 
 def _ocr_pil_image(image: Image.Image) -> str:
-    import pytesseract
-
-    _configure_tesseract()
-    rgb_image = image.convert("RGB")
-    return pytesseract.image_to_string(rgb_image)
+    """OCR one page image: Qwen vision model first, Tesseract as the fallback."""
+    text = _qwen_vision_ocr(image)
+    if normalize_text(text):
+        return text
+    return _tesseract_ocr(image)
 
 
 def _ocr_image_file(path: str) -> str:
@@ -230,11 +331,11 @@ def extract_text_layers_from_file(path: str) -> Dict[str, str]:
 
     if ext == ".pdf":
         native_text = parse_pdf_text(path)
-        if CONFIG["ocr_enabled"]:
+        if CONFIG["ocr_enabled"] and _needs_ocr(native_text):
             ocr_text = _safe_ocr(_ocr_pdf_pages, path)
     elif ext == ".docx":
         native_text = parse_docx_text(path)
-        if CONFIG["ocr_enabled"]:
+        if CONFIG["ocr_enabled"] and _needs_ocr(native_text):
             ocr_text = _safe_ocr(_ocr_docx_embedded_images, path)
     elif ext in {".txt", ".rtf"}:
         native_text = _read_text_file(path)
@@ -264,11 +365,11 @@ def extract_text_layers_from_bytes(data: bytes, file_extension: str, ocr_enabled
 
     if ext == ".pdf":
         native_text = parse_pdf_bytes(data)
-        if ocr_enabled:
+        if ocr_enabled and _needs_ocr(native_text):
             ocr_text = _safe_ocr(_ocr_pdf_pages_bytes, data)
     elif ext == ".docx":
         native_text = parse_docx_bytes(data)
-        if ocr_enabled:
+        if ocr_enabled and _needs_ocr(native_text):
             ocr_text = _safe_ocr(_ocr_docx_embedded_images_bytes, data)
     elif ext in {".txt", ".rtf"}:
         native_text = data.decode("utf-8", errors="ignore")
