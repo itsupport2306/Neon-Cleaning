@@ -197,27 +197,28 @@ def extract_text_layers_from_file(path: str) -> Dict[str, str]:
     }
 
 
-def extract_text_layers_from_bytes(data: bytes, file_extension: str) -> Dict[str, str]:
+def extract_text_layers_from_bytes(data: bytes, file_extension: str, ocr_enabled: bool | None = None) -> Dict[str, str]:
     """Extract text layers from file bytes without saving to disk."""
     ext = file_extension.lower()
     if not ext.startswith("."):
         ext = f".{ext}"
 
+    ocr_enabled = ocr_enabled if ocr_enabled is not None else CONFIG["ocr_enabled"]
     native_text = ""
     ocr_text = ""
 
     if ext == ".pdf":
         native_text = parse_pdf_bytes(data)
-        if CONFIG["ocr_enabled"]:
+        if ocr_enabled:
             ocr_text = _ocr_pdf_pages_bytes(data)
     elif ext == ".docx":
         native_text = parse_docx_bytes(data)
-        if CONFIG["ocr_enabled"]:
+        if ocr_enabled:
             ocr_text = _ocr_docx_embedded_images_bytes(data)
     elif ext in {".txt", ".rtf"}:
         native_text = data.decode("utf-8", errors="ignore")
     elif ext in {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp"}:
-        if CONFIG["ocr_enabled"]:
+        if ocr_enabled:
             ocr_text = _ocr_pil_image(Image.open(io.BytesIO(data)))
     else:
         raise ValueError(f"Unsupported document type: {ext}")
@@ -398,16 +399,21 @@ def _run_openai_compatible_extraction(base_url: str, api_key: str, model: str, t
 
     client = OpenAI(base_url=base_url.rstrip("/") + "/", api_key=api_key, timeout=60.0)
     prompt = (
-        "Extract resume contact fields from this resume text. Return ONLY a JSON object with these exact keys: "
-        "first_name, last_name, city, state_code, specialty, phone, email. "
-        "Set any missing field to null. Do not include any text outside the JSON object.\n\n"
+        "Extract all profile fields from this resume text. "
+        "Return ONLY a JSON object with these keys: first_name, last_name, city, state_code, specialty, phone, email. "
+        "SPECIALTY: Medical/professional specialty (e.g., Cardiology, Emergency Medicine, Pediatrics, etc.). "
+        "STATE_CODE: 2-letter state abbreviation if mentioned. "
+        "PHONE: Contact phone number. "
+        "EMAIL: Contact email. "
+        "Set any missing field to null. Do not invent data or add markdown formatting.\n\n"
         f"RESUME TEXT:\n{text[:16000]}"
     )
+
     try:
         response = client.chat.completions.create(
             model=model,
             messages=[
-                {"role": "system", "content": "Extract data from resumes. Return only valid JSON."},
+                {"role": "system", "content": "Extract data from resumes. Return only valid JSON with no markdown formatting."},
                 {"role": "user", "content": prompt},
             ],
             temperature=0,
@@ -464,15 +470,20 @@ def _run_local_qwen_extraction(text: str) -> Dict[str, Any]:
         return {}
 
     prompt = (
-        "Extract resume contact fields from this resume text. Return ONLY a JSON object with these exact keys: "
-        "first_name, last_name, city, state_code, specialty, phone, email. "
-        "Set any missing field to null. Do not include any text outside the JSON object.\n\n"
+        "Extract all profile fields from this resume text. "
+        "Return ONLY a JSON object with these keys: first_name, last_name, city, state_code, specialty, phone, email. "
+        "SPECIALTY: Medical/professional specialty (e.g., Cardiology, Emergency Medicine, Pediatrics, etc.). "
+        "STATE_CODE: 2-letter state abbreviation if mentioned. "
+        "PHONE: Contact phone number. "
+        "EMAIL: Contact email. "
+        "Set any missing field to null. Do not invent data or add markdown formatting.\n\n"
         f"RESUME TEXT:\n{text[:16000]}"
     )
+
     try:
         response = llm.create_chat_completion(
             messages=[
-                {"role": "system", "content": "Extract data from resumes. Return only valid JSON."},
+                {"role": "system", "content": "Extract data from resumes. Return only valid JSON with no markdown formatting."},
                 {"role": "user", "content": prompt},
             ],
             temperature=0,

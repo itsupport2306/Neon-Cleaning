@@ -23,13 +23,7 @@ CONFIG = {
     "neon_table_name": neon_table_name,
     "neon_reprocess_query": os.getenv(
         "NEON_REPROCESS_QUERY",
-        (
-            f"SELECT * FROM {neon_table_name} "
-            "WHERE specialty IS NULL "
-            "AND state_code IS NULL "
-            "AND email IS NULL "
-            "AND phone IS NULL"
-        ),
+        f"SELECT * FROM {neon_table_name} WHERE specialty IS NULL",
     ),
     "cloudflare_public_base_url": os.getenv("CLOUDFLARE_PUBLIC_BASE_URL"),
     "cloudflare_access_key": os.getenv("CLOUDFLARE_ACCESS_KEY"),

@@ -40,6 +40,61 @@ def _extract_file_extension(file_ref: str) -> str:
     return ext or ".bin"
 
 
+def _verify_and_merge_fields(
+    profile_id: str,
+    existing: Dict[str, Any],
+    extracted: Dict[str, Any],
+) -> Tuple[Dict[str, Any], Dict[str, str]]:
+    """Cross-verify and merge extracted data with existing data.
+
+    Returns tuple of (final_updates, change_log).
+    Change log contains field: "existing_value -> new_value" for changed fields.
+    """
+    TARGET_FIELDS = ("first_name", "last_name", "specialty", "state_code", "email", "phone", "city", "state")
+    updates = {}
+    changes = {}
+
+    for field in TARGET_FIELDS:
+        existing_val = existing.get(field)
+        extracted_val = extracted.get(field)
+
+        existing_clean = _normalize_candidate(existing_val)
+        extracted_clean = _normalize_candidate(extracted_val)
+
+        if not extracted_clean:
+            continue
+
+        if not existing_clean:
+            updates[field] = extracted_clean
+            changes[field] = f"<empty> -> {extracted_clean}"
+            logger.info(
+                "FIELD_ADDED | profile_id=%s | field=%s | value=%s",
+                profile_id,
+                field,
+                extracted_clean,
+            )
+        elif existing_clean.lower() != extracted_clean.lower():
+            if _is_reliable_value(extracted_clean):
+                updates[field] = extracted_clean
+                changes[field] = f"{existing_clean} -> {extracted_clean}"
+                logger.info(
+                    "FIELD_UPDATED | profile_id=%s | field=%s | old=%s | new=%s",
+                    profile_id,
+                    field,
+                    existing_clean,
+                    extracted_clean,
+                )
+        else:
+            logger.info(
+                "FIELD_VERIFIED | profile_id=%s | field=%s | value=%s",
+                profile_id,
+                field,
+                existing_clean,
+            )
+
+    return updates, changes
+
+
 def _is_reliable_value(value: Any) -> bool:
     text = _normalize_candidate(value)
     if not text:
@@ -113,7 +168,7 @@ def _missing_target_fields(extracted: Dict[str, Any]) -> Tuple[str, ...]:
     return tuple(missing)
 
 
-def process_profile_record(row: Dict[str, Any], state: StateManager, existing: Dict[str, Any] | None = None) -> None:
+def process_profile_record(row: Dict[str, Any], state: StateManager, existing: Dict[str, Any] | None = None, comprehensive_reprocess: bool = False, disable_ocr: bool = False) -> None:
     profile_id = _normalize_candidate(row.get("profile_id"))
     if not profile_id:
         logger.warning("MISSING_PROFILE_ID | row=%s", row)
@@ -152,7 +207,7 @@ def process_profile_record(row: Dict[str, Any], state: StateManager, existing: D
 
     file_ext = _extract_file_extension(file_ref)
     try:
-        text_layers = extract_text_layers_from_bytes(file_data, file_ext)
+        text_layers = extract_text_layers_from_bytes(file_data, file_ext, ocr_enabled=not disable_ocr)
     except Exception as exc:  # pragma: no cover - exercised in runtime only
         logger.exception("OCR_EXTRACTION_FAILURE | profile_id=%s | file_ref=%s | error=%s", profile_id, file_ref, exc)
         state.mark_failed(profile_id)
@@ -168,7 +223,10 @@ def process_profile_record(row: Dict[str, Any], state: StateManager, existing: D
     missing_before_ai = _missing_target_fields(extracted)
 
     try:
-        ai_extracted = run_ai_extraction(None, combined_text) if missing_before_ai else {}
+        if comprehensive_reprocess:
+            ai_extracted = run_ai_extraction(None, combined_text) if combined_text.strip() else {}
+        else:
+            ai_extracted = run_ai_extraction(None, combined_text) if missing_before_ai else {}
     except Exception as exc:  # pragma: no cover - exercised in runtime only
         logger.exception("AI_EXTRACTION_FAILURE | profile_id=%s | file_ref=%s | error=%s", profile_id, file_ref, exc)
         ai_extracted = {}
@@ -191,7 +249,19 @@ def process_profile_record(row: Dict[str, Any], state: StateManager, existing: D
         state.mark_failed(profile_id)
         return
 
-    update_map = build_update_map(existing_row, final_extracted)
+    if comprehensive_reprocess:
+        update_map, changes = _verify_and_merge_fields(profile_id, existing_row, final_extracted)
+        if update_map:
+            logger.info(
+                "COMPREHENSIVE_REPROCESS_SUMMARY | profile_id=%s | changes=%s | native_chars=%s | ocr_chars=%s",
+                profile_id,
+                changes,
+                len(text_layers["native_text"]),
+                len(text_layers["ocr_text"]),
+            )
+    else:
+        update_map = build_update_map(existing_row, final_extracted)
+
     if not update_map:
         logger.info(
             "NO_UPDATES_REQUIRED | profile_id=%s | missing_before_ai=%s | native_chars=%s | ocr_chars=%s",
@@ -224,6 +294,8 @@ def run_enrichment(
     csv_path: str | None = None,
     max_rows: int | None = None,
     source: str | None = None,
+    comprehensive_reprocess: bool = False,
+    disable_ocr: bool = False,
 ) -> Dict[str, Any]:
     source_name = (source or CONFIG["profile_source"]).strip().lower()
     state = StateManager(CONFIG["state_file"])
@@ -253,7 +325,13 @@ def run_enrichment(
             skipped += 1
             continue
 
-        process_profile_record(row, state, existing=(row if source_name == "neon" else None))
+        process_profile_record(
+            row,
+            state,
+            existing=(row if source_name == "neon" else None),
+            comprehensive_reprocess=comprehensive_reprocess,
+            disable_ocr=disable_ocr,
+        )
         if state.is_processed(profile_id):
             processed += 1
         elif profile_id in state.failed:
@@ -279,6 +357,8 @@ if __name__ == "__main__":
     parser.add_argument("--csv-path", default=CONFIG["csv_path"], help="Path to the exported NeonDB CSV to process when --source csv.")
     parser.add_argument("--limit", type=int, default=CONFIG["process_limit"], help="Maximum number of rows to process.")
     parser.add_argument("--no-skip-processed", action="store_true", help="Process rows even if they were already marked as processed.")
+    parser.add_argument("--comprehensive", action="store_true", help="Reprocess entire row: extract all fields and cross-verify with existing data.")
+    parser.add_argument("--no-ocr", action="store_true", help="Disable OCR (Tesseract) and use only native text and AI extraction.")
     args = parser.parse_args()
 
     if args.no_skip_processed:
@@ -288,5 +368,7 @@ if __name__ == "__main__":
         csv_path=args.csv_path,
         max_rows=(None if args.limit in (0, None) else args.limit),
         source=args.source,
+        comprehensive_reprocess=args.comprehensive,
+        disable_ocr=args.no_ocr,
     )
     print(result)
