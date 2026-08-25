@@ -226,7 +226,8 @@ def process_profile_record(row: Dict[str, Any], state: StateManager, existing: D
         if comprehensive_reprocess:
             ai_extracted = run_ai_extraction(None, combined_text) if combined_text.strip() else {}
         else:
-            ai_extracted = run_ai_extraction(None, combined_text) if missing_before_ai else {}
+            should_run_ai = missing_before_ai or not combined_text.strip()
+            ai_extracted = run_ai_extraction(None, combined_text) if should_run_ai else {}
     except Exception as exc:  # pragma: no cover - exercised in runtime only
         logger.exception("AI_EXTRACTION_FAILURE | profile_id=%s | file_ref=%s | error=%s", profile_id, file_ref, exc)
         ai_extracted = {}

@@ -336,6 +336,23 @@ def _first_json_object(payload: str) -> Dict[str, Any]:
     raise json.JSONDecodeError("No JSON object found", payload, 0)
 
 
+def _extract_phone(text: str) -> Optional[str]:
+    """Extract phone number, filtering out year ranges like 2020-2024."""
+    patterns = [
+        r"\+1?\s*\(?([0-9]{3})\)?\s*[-.\s]?([0-9]{3})[-.\s]?([0-9]{4})",
+        r"\+1?\s*([0-9]{3})\s+([0-9]{3})\s+([0-9]{4})",
+        r"(?<!\d)\(?([0-9]{3})\)?\s*[-.]?\s*([0-9]{3})[-.]([0-9]{4})(?!\d)",
+    ]
+
+    for pattern in patterns:
+        match = re.search(pattern, text)
+        if match:
+            phone = "".join(re.findall(r"\d", match.group(0)))
+            if len(phone) >= 10:
+                return normalize_text(match.group(0))
+    return None
+
+
 def extract_profile_fields_from_text(text: str) -> Dict[str, Any]:
     extracted: Dict[str, Any] = {}
     cleaned = text.replace("\r", "\n")
@@ -350,7 +367,7 @@ def extract_profile_fields_from_text(text: str) -> Dict[str, Any]:
     if email:
         extracted["email"] = email
 
-    phone = safe_get(r"(?:\+?\d[\d\s().-]{7,}\d)", group=0)
+    phone = _extract_phone(cleaned)
     if phone:
         extracted["phone"] = phone
 

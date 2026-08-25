@@ -1,0 +1,60 @@
+2026-08-25 13:05:19 | INFO | START_PROCESSING | profile_id=2d8dc169-ff33-4530-9a6b-14bd53f2ef6e | file_ref=/files/resumes/Physicians/5e5c8ffe2cdb88681994ec56f5a9876c8a1b904bc9c800699250295d30592746.docx
+2026-08-25 13:05:34 | INFO | FIELD_VERIFIED | profile_id=2d8dc169-ff33-4530-9a6b-14bd53f2ef6e | field=first_name | value=University
+2026-08-25 13:05:34 | INFO | FIELD_VERIFIED | profile_id=2d8dc169-ff33-4530-9a6b-14bd53f2ef6e | field=last_name | value=University
+2026-08-25 13:05:34 | INFO | FIELD_ADDED | profile_id=2d8dc169-ff33-4530-9a6b-14bd53f2ef6e | field=specialty | value=Physician Assistant
+2026-08-25 13:05:34 | INFO | FIELD_ADDED | profile_id=2d8dc169-ff33-4530-9a6b-14bd53f2ef6e | field=state_code | value=CT
+2026-08-25 13:05:34 | INFO | FIELD_ADDED | profile_id=2d8dc169-ff33-4530-9a6b-14bd53f2ef6e | field=email | value=johndoe@example.com
+2026-08-25 13:05:34 | INFO | FIELD_ADDED | profile_id=2d8dc169-ff33-4530-9a6b-14bd53f2ef6e | field=phone | value=+1-123-456-7890
+2026-08-25 13:05:34 | INFO | FIELD_ADDED | profile_id=2d8dc169-ff33-4530-9a6b-14bd53f2ef6e | field=city | value=New Haven
+2026-08-25 13:05:34 | INFO | COMPREHENSIVE_REPROCESS_SUMMARY | profile_id=2d8dc169-ff33-4530-9a6b-14bd53f2ef6e | changes={'specialty': '<empty> -> Physician Assistant', 'state_code': '<empty> -> CT', 'email': '<empty> -> johndoe@example.com', 'phone': '<empty> -> +1-123-456-7890', 'city': '<empty> -> New Haven'} | native_chars=73 | ocr_chars=0
+2026-08-25 13:05:36 | INFO | SUCCESSFUL_UPDATE | profile_id=2d8dc169-ff33-4530-9a6b-14bd53f2ef6e | updated_fields=['city', 'email', 'phone', 'specialty', 'state_code'] | native_chars=73 | ocr_chars=0
+2026-08-25 13:05:36 | INFO | START_PROCESSING | profile_id=12effe90-3596-4160-8ce0-dc23abba88be | file_ref=/files/resumes/Physicians/354e4937cba05a3536c0b080bbb1da6800a9e47cca89ee0859dcc1ae5aaff5e1.docx
+2026-08-25 13:05:45 | INFO | FIELD_ADDED | profile_id=12effe90-3596-4160-8ce0-dc23abba88be | field=specialty | value=Physician Assistant
+2026-08-25 13:05:45 | INFO | COMPREHENSIVE_REPROCESS_SUMMARY | profile_id=12effe90-3596-4160-8ce0-dc23abba88be | changes={'specialty': '<empty> -> Physician Assistant'} | native_chars=84 | ocr_chars=0
+2026-08-25 13:05:47 | INFO | SUCCESSFUL_UPDATE | profile_id=12effe90-3596-4160-8ce0-dc23abba88be | updated_fields=['specialty'] | native_chars=84 | ocr_chars=0
+2026-08-25 13:05:47 | INFO | START_PROCESSING | profile_id=2a4c2d06-e358-4810-8691-15517cb65d3d | file_ref=/files/resumes/Physicians/5de44848f341a3215f406591492e1c36746182d9e7be8bd9409dfb4dc6612a4c.docx
+2026-08-25 13:05:58 | INFO | FIELD_ADDED | profile_id=2a4c2d06-e358-4810-8691-15517cb65d3d | field=specialty | value=Physician Assistant
+2026-08-25 13:05:58 | INFO | COMPREHENSIVE_REPROCESS_SUMMARY | profile_id=2a4c2d06-e358-4810-8691-15517cb65d3d | changes={'specialty': '<empty> -> Physician Assistant'} | native_chars=108 | ocr_chars=0
+2026-08-25 13:06:00 | INFO | SUCCESSFUL_UPDATE | profile_id=2a4c2d06-e358-4810-8691-15517cb65d3d | updated_fields=['specialty'] | native_chars=108 | ocr_chars=0
+2026-08-25 13:06:52 | INFO | START_PROCESSING | profile_id=af666439-5d9e-4b9c-bdcf-9d0bd75547d8 | file_ref=/files/resumes/import/51/51cb8d5d47a9e35c5d2aeb5262a3dbae7239706b5f6f1e65fbed21cd2f0ae39c.pdf
+2026-08-25 13:06:53 | INFO | NO_USEFUL_INFORMATION | profile_id=af666439-5d9e-4b9c-bdcf-9d0bd75547d8 | reason=document was downloaded but no text was extracted
+2026-08-25 13:06:53 | INFO | START_PROCESSING | profile_id=836352ce-8f75-43d3-bcbb-402317aa28aa | file_ref=/files/resumes/import/08/086dc28074964f81c9e97ae7140ae8ae0ede04b1e70d2921df5c2ce9ffefb0fe.pdf
+2026-08-25 13:06:54 | INFO | NO_USEFUL_INFORMATION | profile_id=836352ce-8f75-43d3-bcbb-402317aa28aa | reason=document was downloaded but no text was extracted
+2026-08-25 13:06:54 | INFO | START_PROCESSING | profile_id=6b21be0c-86d6-42da-afdc-2cbe6be0607b | file_ref=/files/resumes/import/a5/a55f7fcc3a1940cfaf931c7ae5affa357ead2edf022c8e1edfecf2a5e5c409e6.pdf
+2026-08-25 13:06:56 | INFO | NO_USEFUL_INFORMATION | profile_id=6b21be0c-86d6-42da-afdc-2cbe6be0607b | reason=document was downloaded but no text was extracted
+2026-08-25 13:06:56 | INFO | START_PROCESSING | profile_id=6ca3608a-5803-45a0-a6b7-d7894c66f4f3 | file_ref=/files/resumes/import/23/23769c3ee2f06fb771919f3302d505000ec5a355ddddf1bf760b87cd98ba245d.docx
+2026-08-25 13:08:28 | INFO | START_PROCESSING | profile_id=e71d4a93-e24c-4743-9b25-a4a162d782da | file_ref=/files/resumes/Physicians/3d84fba4d3479b6e6489ac6957272520ddefce31bd504255340bc3cab6c7fd9e.docx
+2026-08-25 13:08:42 | INFO | FIELD_VERIFIED | profile_id=e71d4a93-e24c-4743-9b25-a4a162d782da | field=first_name | value=Georgetown
+2026-08-25 13:08:42 | INFO | FIELD_UPDATED | profile_id=e71d4a93-e24c-4743-9b25-a4a162d782da | field=last_name | old=Medicine | new=University
+2026-08-25 13:08:42 | INFO | FIELD_ADDED | profile_id=e71d4a93-e24c-4743-9b25-a4a162d782da | field=phone | value=2006 - 2010
+2026-08-25 13:08:42 | INFO | COMPREHENSIVE_REPROCESS_SUMMARY | profile_id=e71d4a93-e24c-4743-9b25-a4a162d782da | changes={'last_name': 'Medicine -> University', 'phone': '<empty> -> 2006 - 2010'} | native_chars=266 | ocr_chars=0
+2026-08-25 13:08:44 | INFO | SUCCESSFUL_UPDATE | profile_id=e71d4a93-e24c-4743-9b25-a4a162d782da | updated_fields=['last_name', 'phone'] | native_chars=266 | ocr_chars=0
+2026-08-25 13:08:44 | INFO | START_PROCESSING | profile_id=d178355a-5b47-4615-af55-d24ee2d64601 | file_ref=/files/resumes/Physicians/66d7ab227bce0e93f0bbeb5d6e143f83ca22c50d2bf3063fecedbf1ea9527731.docx
+2026-08-25 13:08:54 | INFO | NO_USEFUL_INFORMATION | profile_id=d178355a-5b47-4615-af55-d24ee2d64601 | reason=no reliable personal/profile data extracted from document
+2026-08-25 13:08:54 | INFO | START_PROCESSING | profile_id=33b95f87-1c58-4968-abd3-06d3789dc790 | file_ref=/files/resumes/Physicians/002e23460dca553df97be1915f6acbe5d53f1c12bd0dcf45a710db02d37007a4.docx
+2026-08-25 13:09:07 | INFO | FIELD_UPDATED | profile_id=33b95f87-1c58-4968-abd3-06d3789dc790 | field=first_name | old=Residency | new=Valleywise
+2026-08-25 13:09:07 | INFO | FIELD_UPDATED | profile_id=33b95f87-1c58-4968-abd3-06d3789dc790 | field=last_name | old=Radiology-diagnostic | new=Health
+2026-08-25 13:09:07 | INFO | FIELD_ADDED | profile_id=33b95f87-1c58-4968-abd3-06d3789dc790 | field=specialty | value=Radiology-Diagnostic
+2026-08-25 13:09:07 | INFO | FIELD_ADDED | profile_id=33b95f87-1c58-4968-abd3-06d3789dc790 | field=phone | value=1985 - 1986
+2026-08-25 13:09:07 | INFO | COMPREHENSIVE_REPROCESS_SUMMARY | profile_id=33b95f87-1c58-4968-abd3-06d3789dc790 | changes={'first_name': 'Residency -> Valleywise', 'last_name': 'Radiology-diagnostic -> Health', 'specialty': '<empty> -> Radiology-Diagnostic', 'phone': '<empty> -> 1985 - 1986'} | native_chars=390 | ocr_chars=0
+2026-08-25 13:09:09 | INFO | SUCCESSFUL_UPDATE | profile_id=33b95f87-1c58-4968-abd3-06d3789dc790 | updated_fields=['first_name', 'last_name', 'phone', 'specialty'] | native_chars=390 | ocr_chars=0
+2026-08-25 13:10:14 | INFO | START_PROCESSING | profile_id=1fe507dd-734c-4df7-880f-cd0a70d4dc8e | file_ref=/files/resumes/Physicians/6081adffbee7a815da70a91273b6e18a1abd83f9a947b36c7c9cb3fab3451c92.docx
+2026-08-25 13:10:29 | INFO | FIELD_VERIFIED | profile_id=1fe507dd-734c-4df7-880f-cd0a70d4dc8e | field=first_name | value=Certified
+2026-08-25 13:10:29 | INFO | FIELD_VERIFIED | profile_id=1fe507dd-734c-4df7-880f-cd0a70d4dc8e | field=last_name | value=Assistant
+2026-08-25 13:10:29 | INFO | FIELD_ADDED | profile_id=1fe507dd-734c-4df7-880f-cd0a70d4dc8e | field=specialty | value=al Memberships
+2026-08-25 13:10:29 | INFO | COMPREHENSIVE_REPROCESS_SUMMARY | profile_id=1fe507dd-734c-4df7-880f-cd0a70d4dc8e | changes={'specialty': '<empty> -> al Memberships'} | native_chars=318 | ocr_chars=0
+2026-08-25 13:10:31 | INFO | SUCCESSFUL_UPDATE | profile_id=1fe507dd-734c-4df7-880f-cd0a70d4dc8e | updated_fields=['specialty'] | native_chars=318 | ocr_chars=0
+2026-08-25 13:10:31 | INFO | START_PROCESSING | profile_id=e06744c0-926d-4d16-8699-7d587b769a37 | file_ref=/files/resumes/Physicians/b0fa96318e945a1287271cd8f2e66fc30cbfbb16221dd74846cc96c0b9bc6f4f.docx
+2026-08-25 13:10:52 | INFO | FIELD_VERIFIED | profile_id=e06744c0-926d-4d16-8699-7d587b769a37 | field=first_name | value=Certified
+2026-08-25 13:10:52 | INFO | FIELD_VERIFIED | profile_id=e06744c0-926d-4d16-8699-7d587b769a37 | field=last_name | value=Assistant
+2026-08-25 13:10:52 | INFO | FIELD_ADDED | profile_id=e06744c0-926d-4d16-8699-7d587b769a37 | field=specialty | value=Cardiology
+2026-08-25 13:10:52 | INFO | FIELD_ADDED | profile_id=e06744c0-926d-4d16-8699-7d587b769a37 | field=email | value=Johanna Ben-Ami Lerner@setonhall.edu
+2026-08-25 13:10:52 | INFO | FIELD_ADDED | profile_id=e06744c0-926d-4d16-8699-7d587b769a37 | field=phone | value=2025-11-01
+2026-08-25 13:10:52 | INFO | COMPREHENSIVE_REPROCESS_SUMMARY | profile_id=e06744c0-926d-4d16-8699-7d587b769a37 | changes={'specialty': '<empty> -> Cardiology', 'email': '<empty> -> Johanna Ben-Ami Lerner@setonhall.edu', 'phone': '<empty> -> 2025-11-01'} | native_chars=1013 | ocr_chars=0
+2026-08-25 13:10:54 | INFO | SUCCESSFUL_UPDATE | profile_id=e06744c0-926d-4d16-8699-7d587b769a37 | updated_fields=['email', 'phone', 'specialty'] | native_chars=1013 | ocr_chars=0
+2026-08-25 13:10:54 | INFO | START_PROCESSING | profile_id=870add54-2cc6-4bc8-bade-9c8f6e106974 | file_ref=/files/resumes/Physicians/b197cd44b4e043001d938b1cd4d6308776b879c3d894216850239b7e31734a27.docx
+2026-08-25 13:11:05 | INFO | FIELD_ADDED | profile_id=870add54-2cc6-4bc8-bade-9c8f6e106974 | field=specialty | value=Physician Assistant
+2026-08-25 13:11:05 | INFO | FIELD_ADDED | profile_id=870add54-2cc6-4bc8-bade-9c8f6e106974 | field=email | value=example@example.com
+2026-08-25 13:11:05 | INFO | FIELD_ADDED | profile_id=870add54-2cc6-4bc8-bade-9c8f6e106974 | field=phone | value=2017 - 2021
+2026-08-25 13:11:05 | INFO | COMPREHENSIVE_REPROCESS_SUMMARY | profile_id=870add54-2cc6-4bc8-bade-9c8f6e106974 | changes={'specialty': '<empty> -> Physician Assistant', 'email': '<empty> -> example@example.com', 'phone': '<empty> -> 2017 - 2021'} | native_chars=75 | ocr_chars=0
+2026-08-25 13:11:07 | INFO | SUCCESSFUL_UPDATE | profile_id=870add54-2cc6-4bc8-bade-9c8f6e106974 | updated_fields=['email', 'phone', 'specialty'] | native_chars=75 | ocr_chars=0
