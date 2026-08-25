@@ -4,6 +4,28 @@ from pathlib import Path
 from profile_enrichment.config import CONFIG
 
 
+class ConsoleFormatter(logging.Formatter):
+    """Console formatter that keeps output to a single line per event.
+
+    Tracebacks and stack traces still go to the log file; the terminal only
+    shows the message, so long runs stay readable.
+    """
+
+    def formatException(self, ei) -> str:  # noqa: N802 - logging API
+        return ""
+
+    def formatStack(self, stack_info) -> str:  # noqa: N802 - logging API
+        return ""
+
+    def format(self, record: logging.LogRecord) -> str:
+        saved_exc_info, saved_exc_text, saved_stack = record.exc_info, record.exc_text, record.stack_info
+        record.exc_info = record.exc_text = record.stack_info = None
+        try:
+            return super().format(record)
+        finally:
+            record.exc_info, record.exc_text, record.stack_info = saved_exc_info, saved_exc_text, saved_stack
+
+
 def setup_logger() -> logging.Logger:
     log_dir = Path(CONFIG["log_dir"])
     log_dir.mkdir(parents=True, exist_ok=True)
@@ -26,7 +48,12 @@ def setup_logger() -> logging.Logger:
 
     stream_handler = logging.StreamHandler()
     stream_handler.setLevel(logging.INFO)
-    stream_handler.setFormatter(formatter)
+    stream_handler.setFormatter(
+        ConsoleFormatter(
+            "%(asctime)s | %(levelname)s | %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S",
+        )
+    )
 
     logger.addHandler(file_handler)
     logger.addHandler(stream_handler)

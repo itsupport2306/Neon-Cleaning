@@ -1,0 +1,5 @@
+2026-08-25 23:04:54 | ERROR | OCR_EXTRACTION_FAILURE | error=[WinError 5] Access is denied
+Traceback (most recent call last):
+  File "<string>", line 5, in <module>
+PermissionError: [WinError 5] Access is denied
+2026-08-25 23:04:54 | WARNING | OCR_DISABLED | reason=tesseract not runnable ([WinError 5] Access is denied) | continuing with native text only

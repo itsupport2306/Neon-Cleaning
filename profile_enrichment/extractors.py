@@ -21,11 +21,44 @@ def normalize_text(value: Optional[str]) -> str:
     return " ".join(str(value).strip().split())
 
 
+_OCR_UNAVAILABLE_REASON: Optional[str] = None
+
+
 def _configure_tesseract() -> None:
     import pytesseract
 
     if CONFIG["tesseract_cmd"]:
         pytesseract.pytesseract.tesseract_cmd = CONFIG["tesseract_cmd"]
+
+
+def _disable_ocr(reason: str) -> None:
+    """Remember that the OCR engine is unusable so we stop retrying it per file."""
+    global _OCR_UNAVAILABLE_REASON
+    if _OCR_UNAVAILABLE_REASON is None:
+        _OCR_UNAVAILABLE_REASON = reason
+        logger.warning("OCR_DISABLED | reason=%s | continuing with native text only", reason)
+
+
+def _ocr_is_available() -> bool:
+    return _OCR_UNAVAILABLE_REASON is None
+
+
+def _safe_ocr(func, *args) -> str:
+    """Run an OCR helper, degrading to empty text instead of raising."""
+    if not _ocr_is_available():
+        return ""
+    try:
+        return func(*args)
+    except (PermissionError, FileNotFoundError, OSError) as exc:
+        _disable_ocr(f"tesseract not runnable ({exc})")
+        return ""
+    except Exception as exc:
+        message = type(exc).__name__
+        if "TesseractNotFound" in message:
+            _disable_ocr("tesseract binary not found")
+        else:
+            logger.debug("OCR_SKIPPED | %s: %s", message, exc)
+        return ""
 
 
 def has_meaningful_text(text: Optional[str], minimum_chars: Optional[int] = None) -> bool:
@@ -198,16 +231,16 @@ def extract_text_layers_from_file(path: str) -> Dict[str, str]:
     if ext == ".pdf":
         native_text = parse_pdf_text(path)
         if CONFIG["ocr_enabled"]:
-            ocr_text = _ocr_pdf_pages(path)
+            ocr_text = _safe_ocr(_ocr_pdf_pages, path)
     elif ext == ".docx":
         native_text = parse_docx_text(path)
         if CONFIG["ocr_enabled"]:
-            ocr_text = _ocr_docx_embedded_images(path)
+            ocr_text = _safe_ocr(_ocr_docx_embedded_images, path)
     elif ext in {".txt", ".rtf"}:
         native_text = _read_text_file(path)
     elif ext in {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp"}:
         if CONFIG["ocr_enabled"]:
-            ocr_text = _ocr_image_file(path)
+            ocr_text = _safe_ocr(_ocr_image_file, path)
     else:
         raise ValueError(f"Unsupported document type: {ext}")
 
@@ -232,16 +265,16 @@ def extract_text_layers_from_bytes(data: bytes, file_extension: str, ocr_enabled
     if ext == ".pdf":
         native_text = parse_pdf_bytes(data)
         if ocr_enabled:
-            ocr_text = _ocr_pdf_pages_bytes(data)
+            ocr_text = _safe_ocr(_ocr_pdf_pages_bytes, data)
     elif ext == ".docx":
         native_text = parse_docx_bytes(data)
         if ocr_enabled:
-            ocr_text = _ocr_docx_embedded_images_bytes(data)
+            ocr_text = _safe_ocr(_ocr_docx_embedded_images_bytes, data)
     elif ext in {".txt", ".rtf"}:
         native_text = data.decode("utf-8", errors="ignore")
     elif ext in {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp"}:
         if ocr_enabled:
-            ocr_text = _ocr_pil_image(Image.open(io.BytesIO(data)))
+            ocr_text = _safe_ocr(lambda: _ocr_pil_image(Image.open(io.BytesIO(data))))
     else:
         raise ValueError(f"Unsupported document type: {ext}")
 
