@@ -1,15 +1,16 @@
 from __future__ import annotations
 
 import csv
+import os
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Tuple
 
 from profile_enrichment.config import CONFIG
-from profile_enrichment.downloaders import download_file
+from profile_enrichment.downloaders import download_file_bytes
 from profile_enrichment.extractors import (
     combine_extracted_values,
     extract_profile_fields_from_text,
-    extract_text_layers_from_file,
+    extract_text_layers_from_bytes,
     run_ai_extraction,
 )
 from profile_enrichment.logging_utils import setup_logger
@@ -30,6 +31,13 @@ def _normalize_candidate(value: Any) -> str:
         return ""
     text = str(value).strip()
     return " ".join(text.split())
+
+
+def _extract_file_extension(file_ref: str) -> str:
+    """Extract file extension from file reference (URL or path)."""
+    url_path = file_ref.split("?")[0] if "?" in file_ref else file_ref
+    _, ext = os.path.splitext(url_path.lower())
+    return ext or ".bin"
 
 
 def _is_reliable_value(value: Any) -> bool:
@@ -131,21 +139,22 @@ def process_profile_record(row: Dict[str, Any], state: StateManager, existing: D
     logger.info("START_PROCESSING | profile_id=%s | file_ref=%s", profile_id, file_ref)
 
     try:
-        downloaded_path = download_file(file_ref)
+        file_data = download_file_bytes(file_ref)
     except Exception as exc:  # pragma: no cover - exercised in runtime only
         logger.exception("CLOUDFLARE_DOWNLOAD_FAILURE | profile_id=%s | file_ref=%s | error=%s", profile_id, file_ref, exc)
         state.mark_failed(profile_id)
         return
 
-    if not downloaded_path:
+    if not file_data:
         logger.error("CLOUDFLARE_DOWNLOAD_FAILURE | profile_id=%s | file_ref=%s | reason=no file downloaded", profile_id, file_ref)
         state.mark_failed(profile_id)
         return
 
+    file_ext = _extract_file_extension(file_ref)
     try:
-        text_layers = extract_text_layers_from_file(downloaded_path)
+        text_layers = extract_text_layers_from_bytes(file_data, file_ext)
     except Exception as exc:  # pragma: no cover - exercised in runtime only
-        logger.exception("OCR_EXTRACTION_FAILURE | profile_id=%s | path=%s | error=%s", profile_id, downloaded_path, exc)
+        logger.exception("OCR_EXTRACTION_FAILURE | profile_id=%s | file_ref=%s | error=%s", profile_id, file_ref, exc)
         state.mark_failed(profile_id)
         return
 
@@ -159,9 +168,9 @@ def process_profile_record(row: Dict[str, Any], state: StateManager, existing: D
     missing_before_ai = _missing_target_fields(extracted)
 
     try:
-        ai_extracted = run_ai_extraction(downloaded_path, combined_text) if missing_before_ai else {}
+        ai_extracted = run_ai_extraction(None, combined_text) if missing_before_ai else {}
     except Exception as exc:  # pragma: no cover - exercised in runtime only
-        logger.exception("AI_EXTRACTION_FAILURE | profile_id=%s | path=%s | error=%s", profile_id, downloaded_path, exc)
+        logger.exception("AI_EXTRACTION_FAILURE | profile_id=%s | file_ref=%s | error=%s", profile_id, file_ref, exc)
         ai_extracted = {}
 
     final_extracted = sanitize_extracted(combine_extracted_values(extracted, ai_extracted))

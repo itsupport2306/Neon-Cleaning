@@ -45,10 +45,35 @@ def parse_pdf_text(path: str) -> str:
     return "\n".join(pages)
 
 
+def parse_pdf_bytes(data: bytes) -> str:
+    from pypdf import PdfReader
+
+    reader = PdfReader(io.BytesIO(data))
+    pages = []
+    for page in reader.pages:
+        text = page.extract_text() or ""
+        pages.append(text)
+    return "\n".join(pages)
+
+
 def parse_docx_text(path: str) -> str:
     from docx import Document
 
     doc = Document(path)
+    chunks: List[str] = []
+    chunks.extend(p.text for p in doc.paragraphs if p.text.strip())
+    for table in doc.tables:
+        for row in table.rows:
+            values = [cell.text.strip() for cell in row.cells if cell.text.strip()]
+            if values:
+                chunks.append(" | ".join(values))
+    return "\n".join(chunks)
+
+
+def parse_docx_bytes(data: bytes) -> str:
+    from docx import Document
+
+    doc = Document(io.BytesIO(data))
     chunks: List[str] = []
     chunks.extend(p.text for p in doc.paragraphs if p.text.strip())
     for table in doc.tables:
@@ -94,11 +119,43 @@ def _ocr_pdf_pages(path: str) -> str:
     return "\n".join(segments)
 
 
+def _ocr_pdf_pages_bytes(data: bytes) -> str:
+    import pypdfium2 as pdfium
+
+    pdf = pdfium.PdfDocument(io.BytesIO(data))
+    segments: List[str] = []
+    try:
+        for page in pdf:
+            bitmap = page.render(scale=2)
+            image = bitmap.to_pil()
+            text = _ocr_pil_image(image)
+            if text.strip():
+                segments.append(text)
+    finally:
+        pdf.close()
+    return "\n".join(segments)
+
+
 def _ocr_docx_embedded_images(path: str) -> str:
     from PIL import Image
 
     segments: List[str] = []
     with zipfile.ZipFile(path) as archive:
+        for name in archive.namelist():
+            if not name.startswith("word/media/"):
+                continue
+            with archive.open(name) as handle:
+                raw = handle.read()
+            with Image.open(io.BytesIO(raw)) as image:
+                text = _ocr_pil_image(image)
+                if text.strip():
+                    segments.append(text)
+    return "\n".join(segments)
+
+
+def _ocr_docx_embedded_images_bytes(data: bytes) -> str:
+    segments: List[str] = []
+    with zipfile.ZipFile(io.BytesIO(data)) as archive:
         for name in archive.namelist():
             if not name.startswith("word/media/"):
                 continue
@@ -129,6 +186,39 @@ def extract_text_layers_from_file(path: str) -> Dict[str, str]:
     elif ext in {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp"}:
         if CONFIG["ocr_enabled"]:
             ocr_text = _ocr_image_file(path)
+    else:
+        raise ValueError(f"Unsupported document type: {ext}")
+
+    combined_parts = [segment for segment in (native_text, ocr_text) if normalize_text(segment)]
+    return {
+        "native_text": native_text,
+        "ocr_text": ocr_text,
+        "combined_text": "\n\n".join(combined_parts),
+    }
+
+
+def extract_text_layers_from_bytes(data: bytes, file_extension: str) -> Dict[str, str]:
+    """Extract text layers from file bytes without saving to disk."""
+    ext = file_extension.lower()
+    if not ext.startswith("."):
+        ext = f".{ext}"
+
+    native_text = ""
+    ocr_text = ""
+
+    if ext == ".pdf":
+        native_text = parse_pdf_bytes(data)
+        if CONFIG["ocr_enabled"]:
+            ocr_text = _ocr_pdf_pages_bytes(data)
+    elif ext == ".docx":
+        native_text = parse_docx_bytes(data)
+        if CONFIG["ocr_enabled"]:
+            ocr_text = _ocr_docx_embedded_images_bytes(data)
+    elif ext in {".txt", ".rtf"}:
+        native_text = data.decode("utf-8", errors="ignore")
+    elif ext in {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp"}:
+        if CONFIG["ocr_enabled"]:
+            ocr_text = _ocr_pil_image(Image.open(io.BytesIO(data)))
     else:
         raise ValueError(f"Unsupported document type: {ext}")
 
