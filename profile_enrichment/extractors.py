@@ -2,12 +2,17 @@ from __future__ import annotations
 
 import io
 import json
+import logging
 import os
 import re
 import zipfile
 from typing import Any, Dict, List, Optional
 
+from PIL import Image
+
 from profile_enrichment.config import CONFIG
+
+logger = logging.getLogger(__name__)
 
 
 def normalize_text(value: Optional[str]) -> str:
@@ -68,8 +73,6 @@ def _ocr_pil_image(image: Image.Image) -> str:
 
 
 def _ocr_image_file(path: str) -> str:
-    from PIL import Image
-
     with Image.open(path) as image:
         return _ocr_pil_image(image)
 
@@ -303,24 +306,32 @@ def _run_openai_extraction(text: str) -> Dict[str, Any]:
 def _run_openai_compatible_extraction(base_url: str, api_key: str, model: str, text: str) -> Dict[str, Any]:
     from openai import OpenAI
 
-    client = OpenAI(base_url=base_url.rstrip("/") + "/", api_key=api_key)
+    client = OpenAI(base_url=base_url.rstrip("/") + "/", api_key=api_key, timeout=60.0)
     prompt = (
-        "Extract resume contact fields as JSON only. "
-        "Keys must be: first_name, last_name, city, state_code, specialty, phone, email. "
-        "Use null for missing values. Do not add commentary.\n\n"
+        "Extract resume contact fields from this resume text. Return ONLY a JSON object with these exact keys: "
+        "first_name, last_name, city, state_code, specialty, phone, email. "
+        "Set any missing field to null. Do not include any text outside the JSON object.\n\n"
         f"RESUME TEXT:\n{text[:16000]}"
     )
-    response = client.chat.completions.create(
-        model=model,
-        messages=[
-            {"role": "system", "content": "You extract structured data from resumes and return strict JSON."},
-            {"role": "user", "content": prompt},
-        ],
-        temperature=0,
-        max_tokens=CONFIG["local_model_max_tokens"],
-    )
+    try:
+        response = client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": "Extract data from resumes. Return only valid JSON."},
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0,
+            max_tokens=CONFIG["local_model_max_tokens"],
+        )
+    except Exception as exc:
+        logger.warning(f"OpenAI-compatible API error: {exc}")
+        return {}
+
     content = response.choices[0].message.content or "{}"
-    data = _first_json_object(content)
+    try:
+        data = _first_json_object(content)
+    except json.JSONDecodeError:
+        return {}
     return {k: v for k, v in data.items() if v not in (None, "", " ")}
 
 
@@ -356,23 +367,36 @@ def _run_local_qwen_extraction(text: str) -> Dict[str, Any]:
             text=text,
         )
 
-    llm = _load_local_qwen()
+    try:
+        llm = _load_local_qwen()
+    except Exception as exc:
+        logger.warning(f"Failed to load local Qwen model: {exc}")
+        return {}
+
     prompt = (
-        "Extract resume contact fields as JSON only. "
-        "Keys must be: first_name, last_name, city, state_code, specialty, phone, email. "
-        "Use null for missing values. Do not add commentary.\n\n"
+        "Extract resume contact fields from this resume text. Return ONLY a JSON object with these exact keys: "
+        "first_name, last_name, city, state_code, specialty, phone, email. "
+        "Set any missing field to null. Do not include any text outside the JSON object.\n\n"
         f"RESUME TEXT:\n{text[:16000]}"
     )
-    response = llm.create_chat_completion(
-        messages=[
-            {"role": "system", "content": "You extract structured data from resumes and return strict JSON."},
-            {"role": "user", "content": prompt},
-        ],
-        temperature=0,
-        max_tokens=CONFIG["local_model_max_tokens"],
-    )
-    content = response["choices"][0]["message"]["content"] or "{}"
-    data = _first_json_object(content)
+    try:
+        response = llm.create_chat_completion(
+            messages=[
+                {"role": "system", "content": "Extract data from resumes. Return only valid JSON."},
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0,
+            max_tokens=CONFIG["local_model_max_tokens"],
+        )
+    except Exception as exc:
+        logger.warning(f"Local Qwen extraction error: {exc}")
+        return {}
+
+    content = response.get("choices", [{}])[0].get("message", {}).get("content") or "{}"
+    try:
+        data = _first_json_object(content)
+    except json.JSONDecodeError:
+        return {}
     return {k: v for k, v in data.items() if v not in (None, "", " ")}
 
 
