@@ -37,51 +37,73 @@ def has_meaningful_text(text: Optional[str], minimum_chars: Optional[int] = None
 def parse_pdf_text(path: str) -> str:
     from pypdf import PdfReader
 
-    reader = PdfReader(path)
-    pages = []
-    for page in reader.pages:
-        text = page.extract_text() or ""
-        pages.append(text)
-    return "\n".join(pages)
+    try:
+        reader = PdfReader(path)
+        pages = []
+        for page in reader.pages:
+            try:
+                text = page.extract_text() or ""
+                pages.append(text)
+            except Exception as e:
+                logger.debug(f"Failed to extract text from PDF page: {e}")
+        return "\n".join(pages)
+    except Exception as e:
+        logger.debug(f"Failed to read PDF file: {e}")
+        return ""
 
 
 def parse_pdf_bytes(data: bytes) -> str:
     from pypdf import PdfReader
 
-    reader = PdfReader(io.BytesIO(data))
-    pages = []
-    for page in reader.pages:
-        text = page.extract_text() or ""
-        pages.append(text)
-    return "\n".join(pages)
+    try:
+        reader = PdfReader(io.BytesIO(data))
+        pages = []
+        for page in reader.pages:
+            try:
+                text = page.extract_text() or ""
+                pages.append(text)
+            except Exception as e:
+                logger.debug(f"Failed to extract text from PDF page: {e}")
+        return "\n".join(pages)
+    except Exception as e:
+        logger.debug(f"Failed to read PDF file: {e}")
+        return ""
 
 
 def parse_docx_text(path: str) -> str:
     from docx import Document
 
-    doc = Document(path)
-    chunks: List[str] = []
-    chunks.extend(p.text for p in doc.paragraphs if p.text.strip())
-    for table in doc.tables:
-        for row in table.rows:
-            values = [cell.text.strip() for cell in row.cells if cell.text.strip()]
-            if values:
-                chunks.append(" | ".join(values))
-    return "\n".join(chunks)
+    try:
+        doc = Document(path)
+        chunks: List[str] = []
+        chunks.extend(p.text for p in doc.paragraphs if p.text.strip())
+        for table in doc.tables:
+            for row in table.rows:
+                values = [cell.text.strip() for cell in row.cells if cell.text.strip()]
+                if values:
+                    chunks.append(" | ".join(values))
+        return "\n".join(chunks)
+    except Exception as e:
+        logger.debug(f"Failed to read DOCX file: {e}")
+        return ""
 
 
 def parse_docx_bytes(data: bytes) -> str:
     from docx import Document
 
-    doc = Document(io.BytesIO(data))
-    chunks: List[str] = []
-    chunks.extend(p.text for p in doc.paragraphs if p.text.strip())
-    for table in doc.tables:
-        for row in table.rows:
-            values = [cell.text.strip() for cell in row.cells if cell.text.strip()]
-            if values:
-                chunks.append(" | ".join(values))
-    return "\n".join(chunks)
+    try:
+        doc = Document(io.BytesIO(data))
+        chunks: List[str] = []
+        chunks.extend(p.text for p in doc.paragraphs if p.text.strip())
+        for table in doc.tables:
+            for row in table.rows:
+                values = [cell.text.strip() for cell in row.cells if cell.text.strip()]
+                if values:
+                    chunks.append(" | ".join(values))
+        return "\n".join(chunks)
+    except Exception as e:
+        logger.debug(f"Failed to read DOCX file: {e}")
+        return ""
 
 
 def _read_text_file(path: str) -> str:
