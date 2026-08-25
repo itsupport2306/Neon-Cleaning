@@ -1,0 +1,302 @@
+# Phase 2 Profile Enrichment and Correction
+
+This project reprocesses live NeonDB profile rows, downloads the matching Cloudflare resume for each profile, extracts the most reliable personal/profile data from that source, and updates the existing NeonDB row using `profile_id` as the unique key.
+
+The goal is not to create a new extraction pipeline from scratch. It is a safe Phase 2 enrichment workflow that checks the document evidence against the current NeonDB record and only writes trustworthy updates.
+
+## Overview
+
+The workflow is:
+
+1. Query NeonDB for rows where `specialty`, `state_code`, `email`, and `phone` are all `NULL`.
+2. For each row, read the Cloudflare reference such as `/files/resumes/import/...` or a direct public URL.
+3. Download the file from Cloudflare.
+4. Extract native text from the file where possible.
+5. Reprocess the document with Tesseract OCR.
+6. Use a lightweight extraction pass and a local Qwen GGUF fallback when the target fields are still missing.
+7. Validate candidates and discard unreliable placeholders like `Unknown`, `Candidate`, or empty strings.
+8. Match by `profile_id` to the existing NeonDB record.
+9. Update only missing fields with strong evidence.
+10. Log every outcome and keep resumable progress in a JSON state file.
+
+## Project structure
+
+```text
+.
+├── .env.example
+├── README.md
+├── requirements.txt
+├── flat-glade-56456784_production_neondb_2026-08-19_20-25-26.csv
+├── logs/
+├── downloads/
+├── state/
+├── profile_enrichment/
+│   ├── __init__.py
+│   ├── config.py
+│   ├── downloaders.py
+│   ├── extractors.py
+│   ├── logging_utils.py
+│   ├── neon_db.py
+│   ├── processor.py
+│   └── state_manager.py
+└── tests/
+    └── test_processor.py
+```
+
+## Installation
+
+1. Open a terminal in the project root.
+2. Create a virtual environment if desired.
+3. Install the project dependencies:
+
+```bash
+pip install -r requirements.txt
+```
+
+Optional OCR support:
+
+- Install Tesseract on your machine.
+- Set `TESSERACT_CMD` if your installation is not on the default PATH.
+
+## Environment variables
+
+Create a `.env` file from the example:
+
+```bash
+cp .env.example .env
+```
+
+Key values:
+
+- `PROFILE_SOURCE`: `neon` by default. Set `csv` only if you want to process the old export file path.
+- `CSV_PATH`: optional path to the NeonDB-exported CSV when `PROFILE_SOURCE=csv`.
+- `CLOUDFLARE_PUBLIC_BASE_URL`: public base URL for the Cloudflare bucket.
+- `CLOUDFLARE_ACCESS_KEY`: optional storage access key.
+- `CLOUDFLARE_SECRET_KEY`: optional storage secret key.
+- `CLOUDFLARE_BUCKET`: Cloudflare bucket name.
+- `NEON_DB_URL`: direct Postgres connection string for NeonDB.
+- `NEON_TABLE_NAME`: table holding the profile rows.
+- `NEON_REPROCESS_QUERY`: query used to fetch candidate rows for reprocessing.
+- `AI_PROVIDER`: `local_qwen` by default. `openai` is still supported.
+- `AI_MODEL`: LLM model name when `AI_PROVIDER=openai`.
+- `OPENAI_API_KEY`: API key for optional OpenAI extraction.
+- `AI_EXTRACTOR_ENABLED`: set to `true` to enable model fallback.
+- `STATE_FILE`: JSON file used for resumability.
+- `LOG_DIR`: directory for processing logs.
+- `DOWNLOAD_DIR`: local directory for downloaded files.
+- `SKIP_ALREADY_PROCESSED`: set to `true` to avoid reprocessing already completed rows.
+- `OCR_ENABLED`: enables Tesseract OCR for PDFs, images, and DOCX embedded images.
+- `TESSERACT_CMD`: path to the Tesseract executable if it is not on `PATH`.
+- `LOCAL_MODEL_REPO_ID`: default Hugging Face repo for the GGUF model.
+- `LOCAL_MODEL_FILENAME`: GGUF filename or glob pattern, such as `*Q4_K_M.gguf`.
+- `LOCAL_MODEL_PATH`: local path to a pre-downloaded GGUF file. If omitted, the app can download from Hugging Face through `llama-cpp-python`.
+
+## Cloudflare configuration
+
+The CSV contains references like:
+
+```text
+/files/resumes/import/51/51cb8d5d47a9e35c5d2aeb5262a3dbae7239706b5f6f1e65fbed21cd2f0ae39c.pdf
+```
+
+The downloader resolves these in two ways:
+
+- If the value is already a full HTTP URL, it uses it directly.
+- Otherwise, it joins the value to `CLOUDFLARE_PUBLIC_BASE_URL` and downloads the public object.
+
+This works well when your Cloudflare bucket or R2 endpoint is serving public files.
+
+## NeonDB configuration
+
+The application expects the row key to be `profile_id` and updates the table directly with SQL.
+
+Required settings:
+
+```env
+NEON_DB_URL=postgresql://user:password@host:5432/dbname?sslmode=require
+NEON_TABLE_NAME=profiles
+```
+
+The default selection query is:
+
+```sql
+SELECT *
+FROM profiles
+WHERE specialty IS NULL
+  AND state_code IS NULL
+  AND email IS NULL
+  AND phone IS NULL;
+```
+
+Then it updates only missing fields with useful extracted data.
+
+## AI model configuration
+
+Model fallback is optional and runs only when OCR plus regex extraction still misses one or more of the target fields: `specialty`, `state_code`, `email`, or `phone`.
+
+The default local fallback is `Qwen/Qwen2.5-1.5B-Instruct-GGUF`. The most reliable Windows setup is to run a local `llama.cpp` server and point the app at it with `LOCAL_MODEL_BASE_URL` and `LOCAL_MODEL_NAME`.
+
+Example local server command:
+
+```bash
+llama serve -hf Qwen/Qwen2.5-1.5B-Instruct-GGUF:Q4_K_M
+```
+
+If you already have a local GGUF runtime embedded in Python, you can still use `LOCAL_MODEL_PATH` or the Hugging Face repo settings.
+
+If `AI_PROVIDER=openai` and `OPENAI_API_KEY` is present, the app sends the extracted document text to the configured OpenAI model and asks for a small JSON payload containing:
+
+- `first_name`
+- `last_name`
+- `city`
+- `state_code`
+- `specialty`
+- `phone`
+- `email`
+
+If the model call fails, the process keeps the OCR/text result and continues instead of stopping the full batch.
+
+## Source format
+
+The primary input source is the live NeonDB query. If you use `PROFILE_SOURCE=csv`, the keys used by the code include:
+
+- `profile_id`
+- `resume_url`
+- `first_name`
+- `last_name`
+- `city`
+- `state_code`
+- `specialty`
+- `phone`
+- `email`
+
+The most important field is `profile_id`, because it determines the exact NeonDB row to update.
+
+## Extraction process
+
+The extraction pipeline is intentionally conservative:
+
+1. Download the file from Cloudflare.
+2. Parse native PDF or DOCX text where available.
+3. Run Tesseract OCR across PDF page renders, image files, and DOCX embedded media.
+4. Combine native text and OCR text.
+5. Extract candidate fields using regex patterns.
+6. Sanitize the values.
+7. Reject placeholders like `Unknown`, `Candidate`, `N/A`, or empty fields.
+8. If target fields are still missing, ask the configured model for strict JSON extraction.
+9. Merge the best extracted values.
+
+This ensures the system does not overwrite valid data with low-confidence guesses.
+
+## `profile_id` matching and update logic
+
+The update logic uses the live NeonDB row as the input reference, then matches it by `profile_id` against the same table for the update statement.
+
+The update rules are:
+
+- Do not update if there is no `profile_id`.
+- Do not overwrite a non-empty existing field with empty or placeholder data.
+- Update only the fields that are currently blank and have valid extracted values.
+
+The actual update function is intentionally narrow:
+
+```python
+build_update_map(existing, extracted)
+```
+
+This checks each field and only includes it if it passes the validation rules and is not clearly worse than the existing value.
+
+## Logging and error handling
+
+The app writes logs to the console and to `logs/enrichment.log`.
+
+It tracks:
+
+- Successfully processed records
+- Successfully updated records
+- Records with no useful information
+- Cloudflare download failures
+- AI/OCR extraction failures
+- NeonDB update failures
+
+Examples:
+
+- `START_PROCESSING | profile_id=...`
+- `SUCCESSFUL_UPDATE | profile_id=... | updated_fields=[...]`
+- `NO_USEFUL_INFORMATION | profile_id=... | reason=...`
+- `CLOUDFLARE_DOWNLOAD_FAILURE | profile_id=...`
+- `NEONDB_UPDATE_FAILURE | profile_id=...`
+
+## Site-safe resumable processing
+
+A JSON state file stores processed and failed IDs so the job can resume safely.
+
+State file path defaults to:
+
+```text
+./state/enrichment_state.json
+```
+
+The state tracks:
+
+- `processed`
+- `skipped`
+- `failed`
+- `last_run`
+
+This means that if the script is interrupted, you can rerun it and it will skip previously completed rows.
+
+To rerun from the latest point:
+
+```bash
+python -m profile_enrichment.processor --source neon
+```
+
+To force reprocessing all rows:
+
+```bash
+python -m profile_enrichment.processor --source neon --no-skip-processed
+```
+
+## Running the enrichment job
+
+```bash
+python -m profile_enrichment.processor --source neon --limit 100
+```
+
+The script prints a summary result like:
+
+```python
+{
+  'source': 'neon',
+  'csv_path': None,
+  'total_rows': 100,
+  'processed': 42,
+  'skipped': 12,
+  'state_file': './state/enrichment_state.json'
+}
+```
+
+## Testing
+
+The project includes a small pytest file to validate the sanitization logic and update safety rules.
+
+```bash
+pytest -q
+```
+
+## Safety rules
+
+This process is intentionally conservative:
+
+- It does not overwrite with blank values.
+- It does not overwrite with placeholder strings.
+- It does not process rows without a valid `profile_id`.
+- It will keep the original record if the source document is missing or unusable.
+- It logs the reason when there is no reliable information to use.
+
+## Notes
+
+This is not a full replacement for the original extraction pipeline. It is a targeted Phase 2 update process designed to verify and improve data already exported from NeonDB using the source documents stored in Cloudflare.
+
+The corrected data is written directly to NeonDB, not back to the CSV.

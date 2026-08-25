@@ -1,0 +1,13 @@
+psycopg2-binary>=2.9.9
+python-dotenv>=1.0.1
+pandas>=2.2.0
+requests>=2.32.0
+pypdf>=4.2.0
+pypdfium2>=4.30.0
+python-docx==1.2.0
+pytesseract>=0.3.10
+Pillow>=10.4.0
+pytest>=8.3.0
+
+# Optional for AI-assisted parsing
+openai>=1.40.0
