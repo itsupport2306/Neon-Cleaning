@@ -26,11 +26,28 @@ _TESSERACT_UNAVAILABLE_REASON: Optional[str] = None
 _VISION_UNAVAILABLE_REASON: Optional[str] = None
 
 
+def _resolve_tesseract_cmd(configured: str) -> str:
+    """Accept either the tesseract executable or the folder that contains it.
+
+    Pointing TESSERACT_CMD at the install directory is an easy mistake and fails
+    with a bare "[WinError 5] Access is denied", so resolve it here instead.
+    """
+    if not configured:
+        return ""
+    if os.path.isdir(configured):
+        for candidate in ("tesseract.exe", "tesseract"):
+            path = os.path.join(configured, candidate)
+            if os.path.isfile(path):
+                return path
+    return configured
+
+
 def _configure_tesseract() -> None:
     import pytesseract
 
-    if CONFIG["tesseract_cmd"]:
-        pytesseract.pytesseract.tesseract_cmd = CONFIG["tesseract_cmd"]
+    resolved = _resolve_tesseract_cmd(CONFIG["tesseract_cmd"])
+    if resolved:
+        pytesseract.pytesseract.tesseract_cmd = resolved
 
 
 def _disable_tesseract(reason: str) -> None:

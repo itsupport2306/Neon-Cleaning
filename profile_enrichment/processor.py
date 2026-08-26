@@ -17,6 +17,7 @@ from profile_enrichment.extractors import (
 from profile_enrichment.logging_utils import setup_logger
 from profile_enrichment.neon_db import (
     build_update_map,
+    email_belongs_to_another_profile,
     fetch_profile_by_id,
     fetch_profiles_for_reprocessing,
     update_profile_fields,
@@ -255,8 +256,10 @@ def process_profile_record(row: Dict[str, Any], state: StateManager, existing: D
 
     combined_text = text_layers["combined_text"]
     if not combined_text.strip():
+        # Not an error: the document is simply unusable (image-only with OCR down,
+        # empty, or corrupt). Marking it failed hides real failures in the noise.
         _log_no_useful_information(profile_id, "document was downloaded but no text was extracted")
-        state.mark_failed(profile_id)
+        state.mark_skipped(profile_id)
         return
 
     # Stage 1: extract from the document itself (regex over native text + OCR).
@@ -331,6 +334,23 @@ def process_profile_record(row: Dict[str, Any], state: StateManager, existing: D
         )
         state.mark_processed(profile_id)
         return
+
+    if "email" in update_map:
+        try:
+            taken = email_belongs_to_another_profile(update_map["email"], profile_id)
+        except Exception as exc:
+            logger.warning("EMAIL_UNIQUENESS_CHECK_FAILED | profile_id=%s | error=%s", profile_id, exc)
+            taken = False
+        if taken:
+            logger.warning(
+                "REJECTED_AI_VALUE | profile_id=%s | field=email | value=%s | reason=email_already_used_by_another_profile",
+                profile_id,
+                update_map["email"],
+            )
+            update_map.pop("email")
+            if not update_map:
+                state.mark_processed(profile_id)
+                return
 
     try:
         update_profile_fields(profile_id, update_map)

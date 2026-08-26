@@ -52,6 +52,24 @@ def fetch_profile_by_id(profile_id: str) -> Optional[Dict[str, Any]]:
             return dict(zip(columns, row))
 
 
+def email_belongs_to_another_profile(email: str, profile_id: str) -> bool:
+    """True when this email is already stored on a different row.
+
+    `profiles` carries a case-insensitive unique index on email
+    (`ux_profiles_email_ci`), so writing a duplicate raises a UniqueViolation and
+    aborts the whole update. Checking first lets the other verified fields land.
+    """
+    if not email:
+        return False
+
+    table_name = CONFIG["neon_table_name"]
+    sql = f"SELECT 1 FROM {table_name} WHERE lower(email) = lower(%s) AND profile_id <> %s LIMIT 1;"
+    with get_connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(sql, (email, profile_id))
+            return cursor.fetchone() is not None
+
+
 def update_profile_fields(profile_id: str, updates: Dict[str, Any]) -> None:
     if not updates:
         return
