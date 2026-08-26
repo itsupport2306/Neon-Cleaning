@@ -214,3 +214,39 @@ PermissionError: [WinError 5] Access is denied
 2026-08-26 11:14:05 | INFO | FIELD_KEPT | profile_id=p-1 | field=last_name | value=Vrtis | candidate=Patrick | reason=existing_value_confirmed_by_source
 2026-08-26 11:14:05 | INFO | FIELD_ADDED | profile_id=p-1 | field=specialty | value=Cardiology
 2026-08-26 11:14:05 | INFO | FIELD_ADDED | profile_id=p-1 | field=city | value=Austin
+2026-08-26 12:27:01 | INFO | START_PROCESSING | profile_id=p-1 | file_ref=https://example.invalid/resume.pdf
+2026-08-26 12:27:01 | WARNING | REJECTED_AI_VALUE | profile_id=p-1 | field=first_name | value=John | reason=not_found_in_source
+2026-08-26 12:27:01 | WARNING | REJECTED_AI_VALUE | profile_id=p-1 | field=last_name | value=Doe | reason=placeholder_name
+2026-08-26 12:27:01 | WARNING | REJECTED_AI_VALUE | profile_id=p-1 | field=specialty | value=Cardiology | reason=not_found_in_source
+2026-08-26 12:27:01 | WARNING | REJECTED_AI_VALUE | profile_id=p-1 | field=state_code | value=NY | reason=not_found_in_source
+2026-08-26 12:27:01 | WARNING | REJECTED_AI_VALUE | profile_id=p-1 | field=email | value=johndoe@example.com | reason=placeholder_email
+2026-08-26 12:27:01 | WARNING | REJECTED_AI_VALUE | profile_id=p-1 | field=phone | value=123-456-7890 | reason=placeholder_phone
+2026-08-26 12:27:01 | WARNING | REJECTED_AI_VALUE | profile_id=p-1 | field=city | value=New York | reason=not_found_in_source
+2026-08-26 12:27:01 | INFO | FIELD_VERIFIED | profile_id=p-1 | field=first_name | value=Maria
+2026-08-26 12:27:01 | INFO | FIELD_VERIFIED | profile_id=p-1 | field=last_name | value=Armelin
+2026-08-26 12:27:01 | INFO | NO_UPDATES_REQUIRED | profile_id=p-1 | missing_before_ai=['specialty', 'state_code', 'email', 'phone'] | native_chars=84 | ocr_chars=0
+2026-08-26 12:27:01 | INFO | START_PROCESSING | profile_id=p-1 | file_ref=https://example.invalid/resume.pdf
+2026-08-26 12:27:01 | WARNING | REJECTED_AI_VALUE | profile_id=p-1 | field=last_name | value=I'm Patrick | reason=name_looks_like_a_sentence_or_title
+2026-08-26 12:27:01 | INFO | FIELD_VERIFIED | profile_id=p-1 | field=first_name | value=Patrick
+2026-08-26 12:27:01 | INFO | FIELD_VERIFIED | profile_id=p-1 | field=last_name | value=Vrtis
+2026-08-26 12:27:01 | INFO | NO_UPDATES_REQUIRED | profile_id=p-1 | missing_before_ai=['specialty', 'state_code', 'email', 'phone'] | native_chars=99 | ocr_chars=0
+2026-08-26 12:27:01 | INFO | START_PROCESSING | profile_id=p-1 | file_ref=https://example.invalid/resume.pdf
+2026-08-26 12:27:01 | INFO | FIELD_VERIFIED | profile_id=p-1 | field=first_name | value=Patrick
+2026-08-26 12:27:01 | INFO | FIELD_VERIFIED | profile_id=p-1 | field=last_name | value=Vrtis
+2026-08-26 12:27:01 | INFO | FIELD_ADDED | profile_id=p-1 | field=city | value=Austin
+2026-08-26 12:27:01 | INFO | FIELD_ADDED | profile_id=p-1 | field=state_code | value=TX
+2026-08-26 12:27:01 | INFO | FIELD_ADDED | profile_id=p-1 | field=phone | value=(512) 887-2043
+2026-08-26 12:27:01 | INFO | FIELD_ADDED | profile_id=p-1 | field=email | value=patrick.vrtis@stdavids.org
+2026-08-26 12:27:01 | WARNING | EMAIL_UNIQUENESS_CHECK_FAILED | profile_id=p-1 | error=No module named 'psycopg2'
+2026-08-26 12:27:01 | INFO | SUCCESSFUL_UPDATE | profile_id=p-1 | changes=city: <empty> -> Austin; email: <empty> -> patrick.vrtis@stdavids.org; phone: <empty> -> (512) 887-2043; state_code: <empty> -> TX | native_chars=153 | ocr_chars=0 | source=native
+2026-08-26 12:27:01 | WARNING | REJECTED_AI_VALUE | profile_id=- | field=phone | value=5551234567 | reason=placeholder_phone
+2026-08-26 12:27:01 | WARNING | REJECTED_AI_VALUE | profile_id=p-1 | field=email | value=johndoe@example.com | reason=placeholder_email
+2026-08-26 12:27:01 | INFO | FIELD_VERIFIED | profile_id=p-1 | field=first_name | value=Patrick
+2026-08-26 12:27:01 | INFO | FIELD_KEPT | profile_id=p-1 | field=last_name | value=Vrtis | candidate=Patrick | reason=existing_value_confirmed_by_source
+2026-08-26 12:27:01 | INFO | FIELD_ADDED | profile_id=p-1 | field=city | value=Austin
+2026-08-26 12:27:01 | INFO | FIELD_ADDED | profile_id=p-1 | field=specialty | value=Cardiology
+2026-08-26 12:27:01 | INFO | FIELD_ADDED | profile_id=p-1 | field=city | value=Austin
+2026-08-26 12:27:01 | INFO | FIELD_ADDED | profile_id=p-1 | field=state_code | value=TX
+2026-08-26 12:27:01 | INFO | FIELD_ADDED | profile_id=p-1 | field=state_code | value=TX
+2026-08-26 12:27:11 | INFO | FIELD_ADDED | profile_id=x | field=city | value=Murfreesboro
+2026-08-26 12:27:11 | INFO | FIELD_ADDED | profile_id=x | field=state_code | value=TN

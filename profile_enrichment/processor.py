@@ -16,6 +16,7 @@ from profile_enrichment.extractors import (
 )
 from profile_enrichment.logging_utils import setup_logger
 from profile_enrichment.neon_db import (
+    PROFILE_COLUMNS,
     build_update_map,
     email_belongs_to_another_profile,
     fetch_profile_by_id,
@@ -42,16 +43,27 @@ def _extract_file_extension(file_ref: str) -> str:
     return ext or ".bin"
 
 
-MERGE_FIELDS = (
-    "first_name",
-    "last_name",
-    "specialty",
-    "state_code",
-    "email",
-    "phone",
-    "city",
-    "state",
-)
+# Only real `profiles` columns may be written. Extraction also emits aliases such
+# as "state" and "location", which exist to help validation but are NOT columns -
+# writing one straight through fails the whole UPDATE.
+MERGE_FIELD_ALIASES = {
+    "first_name": ("first_name",),
+    "last_name": ("last_name",),
+    "city": ("city",),
+    "state_code": ("state_code", "state"),
+    "specialty": ("specialty",),
+    "phone": ("phone",),
+    "email": ("email",),
+}
+
+
+def _extracted_value_for(field: str, extracted: Dict[str, Any]) -> str:
+    """Resolve a database column from the extracted values, following aliases."""
+    for candidate in MERGE_FIELD_ALIASES[field]:
+        value = _normalize_candidate(extracted.get(candidate))
+        if value:
+            return value
+    return ""
 
 
 def _existing_value_is_in_source(value: str, source_text: str) -> bool:
@@ -87,9 +99,9 @@ def _verify_and_merge_fields(
     updates: Dict[str, Any] = {}
     changes: Dict[str, str] = {}
 
-    for field in MERGE_FIELDS:
+    for field in PROFILE_COLUMNS:
         existing_clean = _normalize_candidate(existing.get(field))
-        extracted_clean = _normalize_candidate(extracted.get(field))
+        extracted_clean = _extracted_value_for(field, extracted)
 
         if not extracted_clean:
             continue

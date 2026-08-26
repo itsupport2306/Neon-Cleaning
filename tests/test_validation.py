@@ -115,3 +115,35 @@ def test_blank_columns_are_filled_from_verified_values():
         "p-1", existing, {"city": "Austin", "specialty": "Cardiology"}, source_text=RESUME
     )
     assert updates == {"city": "Austin", "specialty": "Cardiology"}
+
+
+def test_merge_never_targets_a_non_existent_column():
+    """`state` is an extraction alias, not a `profiles` column - writing it aborts the UPDATE."""
+    from profile_enrichment.neon_db import PROFILE_COLUMNS
+
+    existing = {"first_name": "Patrick", "last_name": "Vrtis", "city": None, "state_code": None}
+    updates, _ = _verify_and_merge_fields(
+        "p-1",
+        existing,
+        {"city": "Austin", "state_code": "TX", "state": "TX", "location": "Austin, TX"},
+        source_text=RESUME,
+    )
+    assert set(updates) <= set(PROFILE_COLUMNS)
+    assert "state" not in updates
+    assert updates["state_code"] == "TX"
+
+
+def test_state_alias_still_populates_state_code():
+    updates, _ = _verify_and_merge_fields(
+        "p-1", {"state_code": None}, {"state": "TX"}, source_text=RESUME
+    )
+    assert updates == {"state_code": "TX"}
+
+
+def test_update_profile_fields_refuses_unknown_columns():
+    import pytest as _pytest
+
+    from profile_enrichment.neon_db import update_profile_fields
+
+    with _pytest.raises(ValueError, match="state"):
+        update_profile_fields("p-1", {"state": "TX"})

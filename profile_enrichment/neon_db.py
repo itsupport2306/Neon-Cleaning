@@ -74,6 +74,12 @@ def update_profile_fields(profile_id: str, updates: Dict[str, Any]) -> None:
     if not updates:
         return
 
+    # Last line of defence: an alias that is not a real column (e.g. "state",
+    # "location") would otherwise abort the entire UPDATE statement.
+    unknown = [key for key in updates if key not in PROFILE_COLUMNS]
+    if unknown:
+        raise ValueError(f"Refusing to update non-profile columns: {sorted(unknown)}")
+
     table_name = CONFIG["neon_table_name"]
     assignments = []
     parameters = []
