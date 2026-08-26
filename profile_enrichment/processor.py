@@ -5,6 +5,7 @@ import os
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Tuple
 
+from profile_enrichment import validation
 from profile_enrichment.config import CONFIG
 from profile_enrichment.downloaders import download_file_bytes
 from profile_enrichment.extractors import (
@@ -40,26 +41,54 @@ def _extract_file_extension(file_ref: str) -> str:
     return ext or ".bin"
 
 
+MERGE_FIELDS = (
+    "first_name",
+    "last_name",
+    "specialty",
+    "state_code",
+    "email",
+    "phone",
+    "city",
+    "state",
+)
+
+
+def _existing_value_is_in_source(value: str, source_text: str) -> bool:
+    """True when the value already stored in NeonDB is visible in the document."""
+    if not value or not source_text:
+        return False
+    lowered = source_text.lower()
+    if any(ch.isdigit() for ch in value):
+        digits = "".join(ch for ch in value if ch.isdigit())
+        if len(digits) >= 7:
+            return digits[-10:] in "".join(ch for ch in source_text if ch.isdigit())
+    return value.lower() in " ".join(lowered.split())
+
+
 def _verify_and_merge_fields(
     profile_id: str,
     existing: Dict[str, Any],
     extracted: Dict[str, Any],
+    source_text: str = "",
 ) -> Tuple[Dict[str, Any], Dict[str, str]]:
-    """Cross-verify and merge extracted data with existing data.
+    """Compare *already validated* values with the stored row.
 
-    Returns tuple of (final_updates, change_log).
-    Change log contains field: "existing_value -> new_value" for changed fields.
+    Every value reaching here has passed :mod:`profile_enrichment.validation`,
+    so it is well formed and present in the source document. This step decides
+    only whether the database should change at all:
+
+    * empty column + verified value -> fill it in
+    * populated column that the document does NOT confirm -> overwrite
+    * populated column that the document DOES confirm -> leave it alone
+
+    That last rule is what keeps `Patrick Vrtis` from becoming `I'm Patrick`.
     """
-    TARGET_FIELDS = ("first_name", "last_name", "specialty", "state_code", "email", "phone", "city", "state")
-    updates = {}
-    changes = {}
+    updates: Dict[str, Any] = {}
+    changes: Dict[str, str] = {}
 
-    for field in TARGET_FIELDS:
-        existing_val = existing.get(field)
-        extracted_val = extracted.get(field)
-
-        existing_clean = _normalize_candidate(existing_val)
-        extracted_clean = _normalize_candidate(extracted_val)
+    for field in MERGE_FIELDS:
+        existing_clean = _normalize_candidate(existing.get(field))
+        extracted_clean = _normalize_candidate(extracted.get(field))
 
         if not extracted_clean:
             continue
@@ -73,75 +102,80 @@ def _verify_and_merge_fields(
                 field,
                 extracted_clean,
             )
-        elif existing_clean.lower() != extracted_clean.lower():
-            if _is_reliable_value(extracted_clean):
-                updates[field] = extracted_clean
-                changes[field] = f"{existing_clean} -> {extracted_clean}"
-                logger.info(
-                    "FIELD_UPDATED | profile_id=%s | field=%s | old=%s | new=%s",
-                    profile_id,
-                    field,
-                    existing_clean,
-                    extracted_clean,
-                )
-        else:
+            continue
+
+        if existing_clean.lower() == extracted_clean.lower():
             logger.info(
                 "FIELD_VERIFIED | profile_id=%s | field=%s | value=%s",
                 profile_id,
                 field,
                 existing_clean,
             )
+            continue
+
+        if not CONFIG["allow_overwrite_existing"]:
+            logger.info(
+                "FIELD_KEPT | profile_id=%s | field=%s | value=%s | reason=overwrites_disabled",
+                profile_id,
+                field,
+                existing_clean,
+            )
+            continue
+
+        if _existing_value_is_in_source(existing_clean, source_text):
+            logger.info(
+                "FIELD_KEPT | profile_id=%s | field=%s | value=%s | candidate=%s | "
+                "reason=existing_value_confirmed_by_source",
+                profile_id,
+                field,
+                existing_clean,
+                extracted_clean,
+            )
+            continue
+
+        updates[field] = extracted_clean
+        changes[field] = f"{existing_clean} -> {extracted_clean}"
+        logger.info(
+            "FIELD_UPDATED | profile_id=%s | field=%s | old=%s | new=%s",
+            profile_id,
+            field,
+            existing_clean,
+            extracted_clean,
+        )
 
     return updates, changes
 
 
 def _is_reliable_value(value: Any) -> bool:
+    """Back-compat helper: a value is reliable when it is not a null/placeholder token."""
     text = _normalize_candidate(value)
-    if not text:
-        return False
-    normalized = text.lower()
-    invalid = {
-        "unknown",
-        "candidate",
-        "n/a",
-        "na",
-        "none",
-        "null",
-        "not provided",
-        "unknown candidate",
-        "no information",
-        "-",
-    }
-    if normalized in invalid:
-        return False
-    if normalized.startswith("unknown") or normalized.startswith("candidate"):
-        return False
     if len(text) < 2:
         return False
-    return True
+    return not validation._is_null_token(text)
 
 
-def sanitize_extracted(extracted: Dict[str, Any]) -> Dict[str, Any]:
-    cleaned: Dict[str, Any] = {}
-    for key, value in extracted.items():
-        normalized = _normalize_candidate(value)
-        if not normalized:
-            continue
+def sanitize_extracted(
+    extracted: Dict[str, Any],
+    source_text: str = "",
+    profile_id: str = "",
+    require_grounding: bool = False,
+) -> Dict[str, Any]:
+    """Validate an extraction result, dropping (and logging) everything unsafe."""
+    return validation.validate_extracted(
+        extracted,
+        source_text=source_text,
+        profile_id=profile_id,
+        require_grounding=require_grounding,
+    )
 
-        if key in {"phone"} and len("".join(ch for ch in normalized if ch.isdigit())) < 7:
-            continue
-        if key == "email" and "@" not in normalized:
-            continue
-        if key in {"state", "state_code"}:
-            if len(normalized) != 2 or not normalized.isalpha():
-                continue
-            normalized = normalized.upper()
 
-        if not _is_reliable_value(normalized):
-            continue
-
-        cleaned[key] = normalized
-    return cleaned
+def _format_changes(existing: Dict[str, Any], update_map: Dict[str, Any]) -> str:
+    """Render the applied updates as `field: old -> new` for the log line."""
+    parts = []
+    for field in sorted(update_map):
+        old = _normalize_candidate(existing.get(field)) or "<empty>"
+        parts.append(f"{field}: {old} -> {update_map[field]}")
+    return "; ".join(parts)
 
 
 _no_useful_information_count = 0
@@ -225,7 +259,13 @@ def process_profile_record(row: Dict[str, Any], state: StateManager, existing: D
         state.mark_failed(profile_id)
         return
 
-    extracted = sanitize_extracted(extract_profile_fields_from_text(combined_text))
+    # Stage 1: extract from the document itself (regex over native text + OCR).
+    extracted = sanitize_extracted(
+        extract_profile_fields_from_text(combined_text),
+        source_text=combined_text,
+        profile_id=profile_id,
+        require_grounding=True,
+    )
     missing_before_ai = _missing_target_fields(extracted)
 
     try:
@@ -238,7 +278,16 @@ def process_profile_record(row: Dict[str, Any], state: StateManager, existing: D
         logger.exception("AI_EXTRACTION_FAILURE | profile_id=%s | file_ref=%s | error=%s", profile_id, file_ref, exc)
         ai_extracted = {}
 
-    final_extracted = sanitize_extracted(combine_extracted_values(extracted, ai_extracted))
+    # Stage 2: validate the AI output on its own, against the same source text, so a
+    # hallucinated value is rejected and logged instead of merged in silently.
+    ai_validated = sanitize_extracted(
+        ai_extracted,
+        source_text=combined_text,
+        profile_id=profile_id,
+        require_grounding=True,
+    )
+
+    final_extracted = combine_extracted_values(extracted, ai_validated)
     if not final_extracted:
         _log_no_useful_information(profile_id, "no reliable personal/profile data extracted from document")
         state.mark_skipped(profile_id)
@@ -257,9 +306,12 @@ def process_profile_record(row: Dict[str, Any], state: StateManager, existing: D
         return
 
     if comprehensive_reprocess:
-        update_map, changes = _verify_and_merge_fields(profile_id, existing_row, final_extracted)
+        update_map, changes = _verify_and_merge_fields(
+            profile_id, existing_row, final_extracted, source_text=combined_text
+        )
         if update_map:
-            logger.info(
+            # The applied result is logged as SUCCESSFUL_UPDATE once the write lands.
+            logger.debug(
                 "COMPREHENSIVE_REPROCESS_SUMMARY | profile_id=%s | changes=%s | native_chars=%s | ocr_chars=%s",
                 profile_id,
                 changes,
@@ -288,11 +340,12 @@ def process_profile_record(row: Dict[str, Any], state: StateManager, existing: D
         return
 
     logger.info(
-        "SUCCESSFUL_UPDATE | profile_id=%s | updated_fields=%s | native_chars=%s | ocr_chars=%s",
+        "SUCCESSFUL_UPDATE | profile_id=%s | changes=%s | native_chars=%s | ocr_chars=%s | source=%s",
         profile_id,
-        sorted(update_map.keys()),
+        _format_changes(existing_row, update_map),
         len(text_layers["native_text"]),
         len(text_layers["ocr_text"]),
+        "ocr" if text_layers["ocr_text"].strip() else "native",
     )
     state.mark_processed(profile_id)
 
@@ -370,6 +423,19 @@ if __name__ == "__main__":
     parser.add_argument("--no-skip-processed", action="store_true", help="Process rows even if they were already marked as processed.")
     parser.add_argument("--comprehensive", action="store_true", help="Reprocess entire row: extract all fields and cross-verify with existing data.")
     parser.add_argument("--no-ocr", action="store_true", help="Disable OCR (Tesseract) and use only native text and AI extraction.")
+    parser.add_argument(
+        "--reprocess-all",
+        action="store_true",
+        help=(
+            "Reprocess every row from its original document, ignoring the processed-state file "
+            "and any values produced by a previous run. Implies --comprehensive and --no-skip-processed."
+        ),
+    )
+    parser.add_argument(
+        "--no-overwrite",
+        action="store_true",
+        help="Only fill blank NeonDB columns; never change a column that already has a value.",
+    )
     parser.add_argument("--verbose", action="store_true", help="Show per-profile diagnostic lines that are normally file-only.")
     args = parser.parse_args()
 
@@ -381,14 +447,22 @@ if __name__ == "__main__":
                 if isinstance(log_filter, ConsoleNoiseFilter):
                     handler.removeFilter(log_filter)
 
-    if args.no_skip_processed:
+    if args.no_skip_processed or args.reprocess_all:
         CONFIG["skip_already_processed"] = False
+
+    if args.reprocess_all:
+        # A full reprocess reads every row from its original document, so it must not
+        # inherit the default "only rows still missing a specialty" filter.
+        CONFIG["neon_reprocess_query"] = f"SELECT * FROM {CONFIG['neon_table_name']}"
+
+    if args.no_overwrite:
+        CONFIG["allow_overwrite_existing"] = False
 
     result = run_enrichment(
         csv_path=args.csv_path,
         max_rows=(None if args.limit in (0, None) else args.limit),
         source=args.source,
-        comprehensive_reprocess=args.comprehensive,
+        comprehensive_reprocess=args.comprehensive or args.reprocess_all,
         disable_ocr=args.no_ocr,
     )
     print(result)

@@ -456,6 +456,41 @@ def _state_from_text(text: str) -> Optional[str]:
     return None
 
 
+EXTRACTION_SYSTEM_PROMPT = (
+    "You are a strict information extractor for resumes. You only copy values that "
+    "are literally present in the supplied text. You never guess, never infer, and "
+    "never invent example data. Return only valid JSON, with no markdown formatting."
+)
+
+# Kept deliberately blunt: the model returning null is the cheap outcome, the model
+# inventing a plausible-looking value is the expensive one.
+EXTRACTION_RULES = (
+    "Extract profile fields from the resume text below.\n"
+    "Return ONLY a JSON object with these keys: first_name, last_name, city, "
+    "state_code, specialty, phone, email.\n"
+    "\n"
+    "HARD RULES:\n"
+    "- Copy values verbatim from the text. Every value you return must appear in the text.\n"
+    "- Do NOT guess. Do NOT infer missing information. Do NOT complete partial data.\n"
+    "- Do NOT generate example, sample, placeholder or default values. Never output "
+    "values such as John Doe, johndoe@example.com, 123-456-7890, New York or "
+    "Cardiology unless those exact values appear in the text.\n"
+    "- If a field is not clearly stated in the text, return null for that field.\n"
+    "- Returning null is always better than returning a value you are unsure about.\n"
+    "- first_name / last_name must be the person's own name, not a heading, job title, "
+    "sentence fragment or employer name. If no person's name is clearly shown, return null.\n"
+    "- specialty: the professional or medical specialty exactly as worded in the text.\n"
+    "- state_code: the 2-letter US state abbreviation, only if a state is stated.\n"
+    "- phone / email: only if a real phone number or email address appears in the text.\n"
+    "\n"
+    "RESUME TEXT:\n"
+)
+
+
+def _build_extraction_prompt(text: str) -> str:
+    return EXTRACTION_RULES + text[:16000]
+
+
 def _first_json_object(payload: str) -> Dict[str, Any]:
     decoder = json.JSONDecoder()
     for index, char in enumerate(payload):
@@ -513,13 +548,16 @@ def extract_profile_fields_from_text(text: str) -> Dict[str, Any]:
             extracted["first_name"] = name_parts[0]
             extracted["last_name"] = name_parts[-1]
 
-    location = safe_get(r"\b(?:Location|Address|Based in)\s*[:\-]?\s*([A-Za-z0-9 .,'#-]+(?:,\s*[A-Z]{2})?)", re.IGNORECASE)
+    # The label must be a whole word followed by a real separator and must stop at the
+    # end of the line - an optional separator let "Profession" match inside
+    # "professional" and swallow the rest of the sentence as a value.
+    location = safe_get(r"(?im)^\s*(?:Location|Address|Based in)\b\s*[:\-]\s*([A-Za-z0-9 .,'#-]+?)\s*$")
     if location:
         extracted["location"] = location
         if "," in location:
             extracted["city"] = normalize_text(location.split(",", 1)[0])
 
-    city = safe_get(r"\b(?:City)\s*[:\-]?\s*([A-Za-z .'-]+(?:,\s*[A-Z]{2})?)", re.IGNORECASE)
+    city = safe_get(r"(?im)^\s*City\b\s*[:\-]\s*([A-Za-z .'-]+?)\s*$")
     if city:
         extracted["city"] = city.split(",", 1)[0].strip()
         location = extracted.get("location") or city
@@ -531,8 +569,8 @@ def extract_profile_fields_from_text(text: str) -> Dict[str, Any]:
         extracted["state"] = state_code
 
     specialty = safe_get(
-        r"\b(?:Specialty|Specialties|Focus|Practice|Profession Type|Profession)\s*[:\-]?\s*([A-Za-z0-9 /&.,()-]+)",
-        re.IGNORECASE,
+        r"(?im)^\s*(?:Specialty|Specialties|Focus|Practice Area|Profession Type|Profession)\b"
+        r"\s*[:\-]\s*([A-Za-z /&.()-]+?)\s*$"
     )
     if specialty:
         extracted["specialty"] = specialty
@@ -548,16 +586,13 @@ def _run_openai_extraction(text: str) -> Dict[str, Any]:
         raise ValueError("OPENAI_API_KEY is not configured")
 
     client = OpenAI(api_key=api_key)
-    prompt = (
-        "Extract a structured JSON object from this resume text. "
-        "Return only JSON with keys: first_name, last_name, city, state_code, specialty, phone, email. "
-        "Use null for missing values and do not invent data.\n\n"
-        f"TEXT:\n{text[:16000]}"
-    )
 
     response = client.chat.completions.create(
         model=CONFIG["ai_model"],
-        messages=[{"role": "user", "content": prompt}],
+        messages=[
+            {"role": "system", "content": EXTRACTION_SYSTEM_PROMPT},
+            {"role": "user", "content": _build_extraction_prompt(text)},
+        ],
         temperature=0,
         max_tokens=800,
     )
@@ -571,22 +606,13 @@ def _run_openai_compatible_extraction(base_url: str, api_key: str, model: str, t
     from openai import OpenAI
 
     client = OpenAI(base_url=base_url.rstrip("/") + "/", api_key=api_key, timeout=60.0)
-    prompt = (
-        "Extract all profile fields from this resume text. "
-        "Return ONLY a JSON object with these keys: first_name, last_name, city, state_code, specialty, phone, email. "
-        "SPECIALTY: Medical/professional specialty (e.g., Cardiology, Emergency Medicine, Pediatrics, etc.). "
-        "STATE_CODE: 2-letter state abbreviation if mentioned. "
-        "PHONE: Contact phone number. "
-        "EMAIL: Contact email. "
-        "Set any missing field to null. Do not invent data or add markdown formatting.\n\n"
-        f"RESUME TEXT:\n{text[:16000]}"
-    )
+    prompt = _build_extraction_prompt(text)
 
     try:
         response = client.chat.completions.create(
             model=model,
             messages=[
-                {"role": "system", "content": "Extract data from resumes. Return only valid JSON with no markdown formatting."},
+                {"role": "system", "content": EXTRACTION_SYSTEM_PROMPT},
                 {"role": "user", "content": prompt},
             ],
             temperature=0,
@@ -642,21 +668,12 @@ def _run_local_qwen_extraction(text: str) -> Dict[str, Any]:
         logger.warning(f"Failed to load local Qwen model: {exc}")
         return {}
 
-    prompt = (
-        "Extract all profile fields from this resume text. "
-        "Return ONLY a JSON object with these keys: first_name, last_name, city, state_code, specialty, phone, email. "
-        "SPECIALTY: Medical/professional specialty (e.g., Cardiology, Emergency Medicine, Pediatrics, etc.). "
-        "STATE_CODE: 2-letter state abbreviation if mentioned. "
-        "PHONE: Contact phone number. "
-        "EMAIL: Contact email. "
-        "Set any missing field to null. Do not invent data or add markdown formatting.\n\n"
-        f"RESUME TEXT:\n{text[:16000]}"
-    )
+    prompt = _build_extraction_prompt(text)
 
     try:
         response = llm.create_chat_completion(
             messages=[
-                {"role": "system", "content": "Extract data from resumes. Return only valid JSON with no markdown formatting."},
+                {"role": "system", "content": EXTRACTION_SYSTEM_PROMPT},
                 {"role": "user", "content": prompt},
             ],
             temperature=0,

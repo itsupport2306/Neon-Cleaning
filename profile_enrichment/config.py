@@ -38,6 +38,8 @@ CONFIG = {
     "log_dir": os.getenv("LOG_DIR", str(ROOT_DIR / "logs")),
     "download_dir": os.getenv("DOWNLOAD_DIR", str(ROOT_DIR / "downloads")),
     "skip_already_processed": get_bool("SKIP_ALREADY_PROCESSED", True),
+    # When false, a populated NeonDB column is never overwritten, only blanks are filled.
+    "allow_overwrite_existing": get_bool("ALLOW_OVERWRITE_EXISTING", True),
     "tesseract_cmd": os.getenv("TESSERACT_CMD"),
     "ocr_enabled": get_bool("OCR_ENABLED", True),
     "ocr_min_text_chars": int(os.getenv("OCR_MIN_TEXT_CHARS", "120") or 120),

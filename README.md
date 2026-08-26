@@ -187,15 +187,50 @@ The extraction pipeline is intentionally conservative:
 
 1. Download the file from Cloudflare.
 2. Parse native PDF or DOCX text where available.
-3. Run Tesseract OCR across PDF page renders, image files, and DOCX embedded media.
-4. Combine native text and OCR text.
+3. Run OCR (Qwen vision first, Tesseract as fallback) across PDF page renders, image files, and DOCX embedded media.
+4. Combine native text and OCR text - this combined text is the only source of truth for the rest of the run.
 5. Extract candidate fields using regex patterns.
-6. Sanitize the values.
-7. Reject placeholders like `Unknown`, `Candidate`, `N/A`, or empty fields.
-8. If target fields are still missing, ask the configured model for strict JSON extraction.
-9. Merge the best extracted values.
+6. Ask the configured model for strict JSON extraction.
+7. **Validate** every candidate value independently (see below).
+8. **Compare** the surviving values with the stored NeonDB row.
+9. Update only the fields that passed every gate.
 
-This ensures the system does not overwrite valid data with low-confidence guesses.
+Extraction, validation, comparison and updating are separate stages. An
+extraction result is never treated as an update on its own: **no evidence, no
+update.**
+
+### Validation gates
+
+`profile_enrichment/validation.py` puts every candidate value through three gates:
+
+1. **Shape** - does it look like an email / phone / name / 2-letter state at all?
+2. **Placeholder rejection** - values such as `johndoe@example.com`, `123-456-7890`,
+   `John Doe`, `Anytown`, `N/A` and `Unknown` are refused outright. A name that is
+   really a sentence, heading or job title (`I'm Patrick`, `Certified Assistant`) is
+   refused too, as is a specialty that is really a slice of prose.
+3. **Source grounding** - the value must actually occur in the document text. A city,
+   specialty, email or phone number that is nowhere in the resume is never written,
+   no matter how confidently the model returned it.
+
+Every rejected value is logged so a bad model, a bad prompt and a bad rule can be
+told apart:
+
+```
+REJECTED_AI_VALUE | profile_id=... | field=email | value=johndoe@example.com | reason=placeholder_email
+```
+
+The extraction prompt itself tells the model to return `null` rather than guess,
+infer, complete partial data or emit example values.
+
+### Existing values
+
+A column that already holds a value is only changed when the document does **not**
+confirm what is stored and the new value is fully verified. If the resume shows
+`Patrick Vrtis`, that name stays - a competing extraction cannot displace it. Pass
+`--no-overwrite` (or set `ALLOW_OVERWRITE_EXISTING=false`) to fill blanks only and
+never touch a populated column.
+
+An empty field is an acceptable outcome. A fabricated field is not.
 
 ## `profile_id` matching and update logic
 
@@ -273,6 +308,19 @@ python -m profile_enrichment.processor --source neon --no-skip-processed
 python -m profile_enrichment.processor --source neon --limit 100
 ```
 
+To reprocess the whole dataset from the original documents, ignoring the
+processed-state file and every value a previous run produced:
+
+```bash
+python -m profile_enrichment.processor --source neon --reprocess-all
+```
+
+`--reprocess-all` implies `--comprehensive` and `--no-skip-processed`, and reads
+every row in the table rather than only the rows still missing a specialty. Each
+row is rebuilt from its source document: original file -> native text/OCR -> AI
+extraction -> validation -> comparison with the stored row -> update of the
+verified fields only.
+
 The script prints a summary result like:
 
 ```python
@@ -300,6 +348,8 @@ This process is intentionally conservative:
 
 - It does not overwrite with blank values.
 - It does not overwrite with placeholder strings.
+- It never invents a value to fill an empty column; every value must be present in the source document.
+- It does not replace a stored value that the source document confirms.
 - It does not process rows without a valid `profile_id`.
 - It will keep the original record if the source document is missing or unusable.
 - It logs the reason when there is no reliable information to use.
