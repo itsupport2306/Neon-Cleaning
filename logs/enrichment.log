@@ -250,3 +250,8 @@ PermissionError: [WinError 5] Access is denied
 2026-08-26 12:27:01 | INFO | FIELD_ADDED | profile_id=p-1 | field=state_code | value=TX
 2026-08-26 12:27:11 | INFO | FIELD_ADDED | profile_id=x | field=city | value=Murfreesboro
 2026-08-26 12:27:11 | INFO | FIELD_ADDED | profile_id=x | field=state_code | value=TN
+2026-09-02 23:13:33 | WARNING | REJECTED_AI_VALUE | profile_id=- | field=phone | value=5551234567 | reason=placeholder_phone
+2026-09-02 23:37:01 | WARNING | REJECTED_AI_VALUE | profile_id=- | field=phone | value=5551234567 | reason=placeholder_phone
+2026-09-03 14:58:33 | WARNING | REJECTED_AI_VALUE | profile_id=- | field=phone | value=5551234567 | reason=placeholder_phone
+2026-09-03 14:58:33 | INFO | START_PROCESSING | profile_id=abc-123 | file_ref=resume.pdf
+2026-09-03 14:58:33 | INFO | SUCCESSFUL_UPDATE | profile_id=abc-123 | changes=screen_reason: <empty> -> AI | native_chars=20 | ocr_chars=0 | source=native

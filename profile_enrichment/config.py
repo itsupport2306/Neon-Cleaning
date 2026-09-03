@@ -34,6 +34,7 @@ CONFIG = {
     "openai_api_key": os.getenv("OPENAI_API_KEY"),
     "ai_extractor_enabled": get_bool("AI_EXTRACTOR_ENABLED", True),
     "process_limit": int(os.getenv("PROCESS_LIMIT", "0") or 0),
+    "worker_count": max(1, int(os.getenv("WORKER_COUNT", "3") or 3)),
     "state_file": os.getenv("STATE_FILE", str(ROOT_DIR / "state" / "enrichment_state.json")),
     "log_dir": os.getenv("LOG_DIR", str(ROOT_DIR / "logs")),
     "download_dir": os.getenv("DOWNLOAD_DIR", str(ROOT_DIR / "downloads")),

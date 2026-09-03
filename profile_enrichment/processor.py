@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import csv
 import os
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Tuple
 
@@ -27,6 +29,7 @@ from profile_enrichment.state_manager import StateManager
 
 logger = setup_logger()
 TARGET_FIELDS = ("specialty", "state_code", "email", "phone")
+AI_SCREEN_REASON = "AI"
 
 
 def _normalize_candidate(value: Any) -> str:
@@ -192,12 +195,14 @@ def _format_changes(existing: Dict[str, Any], update_map: Dict[str, Any]) -> str
 
 
 _no_useful_information_count = 0
+_no_useful_information_lock = threading.Lock()
 
 
 def _log_no_useful_information(profile_id: str, reason: str) -> None:
     """Logged to the file only; the terminal gets the run-end count instead."""
     global _no_useful_information_count
-    _no_useful_information_count += 1
+    with _no_useful_information_lock:
+        _no_useful_information_count += 1
     logger.info("NO_USEFUL_INFORMATION | profile_id=%s | reason=%s", profile_id, reason)
 
 
@@ -221,16 +226,22 @@ def _missing_target_fields(extracted: Dict[str, Any]) -> Tuple[str, ...]:
     return tuple(missing)
 
 
-def process_profile_record(row: Dict[str, Any], state: StateManager, existing: Dict[str, Any] | None = None, comprehensive_reprocess: bool = False, disable_ocr: bool = False) -> None:
+def process_profile_record(
+    row: Dict[str, Any],
+    state: StateManager,
+    existing: Dict[str, Any] | None = None,
+    comprehensive_reprocess: bool = False,
+    disable_ocr: bool = False,
+) -> str:
     profile_id = _normalize_candidate(row.get("profile_id"))
     if not profile_id:
         logger.warning("MISSING_PROFILE_ID | row=%s", row)
-        return
+        return "invalid"
 
     if CONFIG["skip_already_processed"] and state.is_processed(profile_id):
         state.mark_skipped(profile_id)
         logger.info("SKIPPED_ALREADY_PROCESSED | profile_id=%s", profile_id)
-        return
+        return "skipped"
 
     file_ref = (
         row.get("resume_url")
@@ -242,7 +253,7 @@ def process_profile_record(row: Dict[str, Any], state: StateManager, existing: D
     if not file_ref:
         _log_no_useful_information(profile_id, "missing file reference on source record")
         state.mark_failed(profile_id)
-        return
+        return "failed"
 
     logger.info("START_PROCESSING | profile_id=%s | file_ref=%s", profile_id, file_ref)
 
@@ -251,12 +262,12 @@ def process_profile_record(row: Dict[str, Any], state: StateManager, existing: D
     except Exception as exc:  # pragma: no cover - exercised in runtime only
         logger.exception("CLOUDFLARE_DOWNLOAD_FAILURE | profile_id=%s | file_ref=%s | error=%s", profile_id, file_ref, exc)
         state.mark_failed(profile_id)
-        return
+        return "failed"
 
     if not file_data:
         logger.error("CLOUDFLARE_DOWNLOAD_FAILURE | profile_id=%s | file_ref=%s | reason=no file downloaded", profile_id, file_ref)
         state.mark_failed(profile_id)
-        return
+        return "failed"
 
     file_ext = _extract_file_extension(file_ref)
     try:
@@ -264,7 +275,7 @@ def process_profile_record(row: Dict[str, Any], state: StateManager, existing: D
     except Exception as exc:  # pragma: no cover - exercised in runtime only
         logger.exception("OCR_EXTRACTION_FAILURE | profile_id=%s | file_ref=%s | error=%s", profile_id, file_ref, exc)
         state.mark_failed(profile_id)
-        return
+        return "failed"
 
     combined_text = text_layers["combined_text"]
     if not combined_text.strip():
@@ -272,7 +283,7 @@ def process_profile_record(row: Dict[str, Any], state: StateManager, existing: D
         # empty, or corrupt). Marking it failed hides real failures in the noise.
         _log_no_useful_information(profile_id, "document was downloaded but no text was extracted")
         state.mark_skipped(profile_id)
-        return
+        return "skipped"
 
     # Stage 1: extract from the document itself (regex over native text + OCR).
     extracted = sanitize_extracted(
@@ -282,16 +293,20 @@ def process_profile_record(row: Dict[str, Any], state: StateManager, existing: D
         require_grounding=True,
     )
     missing_before_ai = _missing_target_fields(extracted)
+    ai_processed = False
 
     try:
         if comprehensive_reprocess:
             ai_extracted = run_ai_extraction(None, combined_text) if combined_text.strip() else {}
+            ai_processed = bool(combined_text.strip())
         else:
             should_run_ai = missing_before_ai or not combined_text.strip()
             ai_extracted = run_ai_extraction(None, combined_text) if should_run_ai else {}
+            ai_processed = bool(should_run_ai)
     except Exception as exc:  # pragma: no cover - exercised in runtime only
         logger.exception("AI_EXTRACTION_FAILURE | profile_id=%s | file_ref=%s | error=%s", profile_id, file_ref, exc)
         ai_extracted = {}
+        ai_processed = False
 
     # Stage 2: validate the AI output on its own, against the same source text, so a
     # hallucinated value is rejected and logged instead of merged in silently.
@@ -303,22 +318,22 @@ def process_profile_record(row: Dict[str, Any], state: StateManager, existing: D
     )
 
     final_extracted = combine_extracted_values(extracted, ai_validated)
-    if not final_extracted:
+    if not final_extracted and not ai_processed:
         _log_no_useful_information(profile_id, "no reliable personal/profile data extracted from document")
         state.mark_skipped(profile_id)
-        return
+        return "skipped"
 
     try:
         existing_row = existing or fetch_profile_by_id(profile_id)
     except Exception as exc:  # pragma: no cover - exercised in runtime only
         logger.exception("NEONDB_QUERY_FAILURE | profile_id=%s | error=%s", profile_id, exc)
         state.mark_failed(profile_id)
-        return
+        return "failed"
 
     if not existing_row:
         logger.error("PROFILE_NOT_FOUND | profile_id=%s", profile_id)
         state.mark_failed(profile_id)
-        return
+        return "failed"
 
     if comprehensive_reprocess:
         update_map, changes = _verify_and_merge_fields(
@@ -336,6 +351,9 @@ def process_profile_record(row: Dict[str, Any], state: StateManager, existing: D
     else:
         update_map = build_update_map(existing_row, final_extracted)
 
+    if ai_processed and _normalize_candidate(existing_row.get("screen_reason")).upper() != AI_SCREEN_REASON:
+        update_map["screen_reason"] = AI_SCREEN_REASON
+
     if not update_map:
         logger.info(
             "NO_UPDATES_REQUIRED | profile_id=%s | missing_before_ai=%s | native_chars=%s | ocr_chars=%s",
@@ -345,7 +363,7 @@ def process_profile_record(row: Dict[str, Any], state: StateManager, existing: D
             len(text_layers["ocr_text"]),
         )
         state.mark_processed(profile_id)
-        return
+        return "processed"
 
     if "email" in update_map:
         try:
@@ -362,14 +380,14 @@ def process_profile_record(row: Dict[str, Any], state: StateManager, existing: D
             update_map.pop("email")
             if not update_map:
                 state.mark_processed(profile_id)
-                return
+                return "processed"
 
     try:
         update_profile_fields(profile_id, update_map)
     except Exception as exc:  # pragma: no cover - exercised in runtime only
         logger.exception("NEONDB_UPDATE_FAILURE | profile_id=%s | updates=%s | error=%s", profile_id, update_map, exc)
         state.mark_failed(profile_id)
-        return
+        return "failed"
 
     logger.info(
         "SUCCESSFUL_UPDATE | profile_id=%s | changes=%s | native_chars=%s | ocr_chars=%s | source=%s",
@@ -380,6 +398,7 @@ def process_profile_record(row: Dict[str, Any], state: StateManager, existing: D
         "ocr" if text_layers["ocr_text"].strip() else "native",
     )
     state.mark_processed(profile_id)
+    return "processed"
 
 
 def run_enrichment(
@@ -388,8 +407,10 @@ def run_enrichment(
     source: str | None = None,
     comprehensive_reprocess: bool = False,
     disable_ocr: bool = False,
+    worker_count: int | None = None,
 ) -> Dict[str, Any]:
     source_name = (source or CONFIG["profile_source"]).strip().lower()
+    worker_count = max(1, worker_count or CONFIG["worker_count"])
     state = StateManager(CONFIG["state_file"])
     state.set_last_run(datetime.now(timezone.utc).isoformat())
 
@@ -407,32 +428,40 @@ def run_enrichment(
     processed = 0
     skipped = 0
 
+    candidate_rows: List[Dict[str, Any]] = []
     for row in rows:
-        if source_name == "csv" and max_rows is not None and total_rows >= max_rows:
+        if source_name == "csv" and max_rows is not None and len(candidate_rows) >= max_rows:
             break
-        total_rows += 1
-
         profile_id = _normalize_candidate(row.get("profile_id"))
         if not profile_id:
             continue
 
         if CONFIG["skip_already_processed"] and state.is_processed(profile_id):
+            total_rows += 1
             skipped += 1
             continue
 
-        process_profile_record(
-            row,
-            state,
-            existing=(row if source_name == "neon" else None),
-            comprehensive_reprocess=comprehensive_reprocess,
-            disable_ocr=disable_ocr,
-        )
-        if state.is_processed(profile_id):
-            processed += 1
-        elif profile_id in state.failed:
-            continue
-        elif profile_id in state.skipped:
-            skipped += 1
+        candidate_rows.append(row)
+        total_rows += 1
+
+    with ThreadPoolExecutor(max_workers=worker_count) as executor:
+        futures = [
+            executor.submit(
+                process_profile_record,
+                row,
+                state,
+                existing=(row if source_name == "neon" else None),
+                comprehensive_reprocess=comprehensive_reprocess,
+                disable_ocr=disable_ocr,
+            )
+            for row in candidate_rows
+        ]
+        for future in as_completed(futures):
+            outcome = future.result()
+            if outcome == "processed":
+                processed += 1
+            elif outcome == "skipped":
+                skipped += 1
 
     return {
         "source": source_name,
@@ -440,6 +469,7 @@ def run_enrichment(
         "total_rows": total_rows,
         "processed": processed,
         "skipped": skipped,
+        "worker_count": worker_count,
         "no_text_extracted": _no_useful_information_count,
         "state_file": str(state.state_path),
     }
@@ -455,6 +485,7 @@ if __name__ == "__main__":
     parser.add_argument("--no-skip-processed", action="store_true", help="Process rows even if they were already marked as processed.")
     parser.add_argument("--comprehensive", action="store_true", help="Reprocess entire row: extract all fields and cross-verify with existing data.")
     parser.add_argument("--no-ocr", action="store_true", help="Disable OCR (Tesseract) and use only native text and AI extraction.")
+    parser.add_argument("--workers", type=int, default=CONFIG["worker_count"], help="Number of concurrent resume-processing workers to run.")
     parser.add_argument(
         "--reprocess-all",
         action="store_true",
@@ -496,5 +527,6 @@ if __name__ == "__main__":
         source=args.source,
         comprehensive_reprocess=args.comprehensive or args.reprocess_all,
         disable_ocr=args.no_ocr,
+        worker_count=args.workers,
     )
     print(result)

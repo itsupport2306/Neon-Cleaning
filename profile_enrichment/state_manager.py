@@ -1,4 +1,5 @@
 import json
+import threading
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -9,6 +10,7 @@ class StateManager:
     def __init__(self, state_path: Optional[str] = None):
         self.state_path = Path(state_path or CONFIG["state_file"])
         self.state_path.parent.mkdir(parents=True, exist_ok=True)
+        self._lock = threading.RLock()
         self._state = self._load()
 
     def _load(self) -> Dict[str, Any]:
@@ -26,8 +28,9 @@ class StateManager:
         return {"processed": [], "skipped": [], "failed": [], "last_run": None}
 
     def save(self) -> None:
-        with self.state_path.open("w", encoding="utf-8") as fh:
-            json.dump(self._state, fh, indent=2, sort_keys=True)
+        with self._lock:
+            with self.state_path.open("w", encoding="utf-8") as fh:
+                json.dump(self._state, fh, indent=2, sort_keys=True)
 
     @property
     def processed(self) -> list[str]:
@@ -42,23 +45,28 @@ class StateManager:
         return self._state.setdefault("failed", [])
 
     def mark_processed(self, profile_id: str) -> None:
-        if profile_id not in self.processed:
-            self.processed.append(profile_id)
-        self.save()
+        with self._lock:
+            if profile_id not in self.processed:
+                self.processed.append(profile_id)
+            self.save()
 
     def mark_skipped(self, profile_id: str) -> None:
-        if profile_id not in self.skipped:
-            self.skipped.append(profile_id)
-        self.save()
+        with self._lock:
+            if profile_id not in self.skipped:
+                self.skipped.append(profile_id)
+            self.save()
 
     def mark_failed(self, profile_id: str) -> None:
-        if profile_id not in self.failed:
-            self.failed.append(profile_id)
-        self.save()
+        with self._lock:
+            if profile_id not in self.failed:
+                self.failed.append(profile_id)
+            self.save()
 
     def is_processed(self, profile_id: str) -> bool:
-        return profile_id in self.processed
+        with self._lock:
+            return profile_id in self.processed
 
     def set_last_run(self, timestamp: str) -> None:
-        self._state["last_run"] = timestamp
-        self.save()
+        with self._lock:
+            self._state["last_run"] = timestamp
+            self.save()

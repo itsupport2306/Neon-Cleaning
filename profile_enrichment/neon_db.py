@@ -14,6 +14,8 @@ PROFILE_COLUMNS = (
     "email",
 )
 
+WRITABLE_COLUMNS = PROFILE_COLUMNS + ("screen_reason",)
+
 
 def get_connection():
     if not CONFIG["neon_db_url"]:
@@ -76,7 +78,7 @@ def update_profile_fields(profile_id: str, updates: Dict[str, Any]) -> None:
 
     # Last line of defence: an alias that is not a real column (e.g. "state",
     # "location") would otherwise abort the entire UPDATE statement.
-    unknown = [key for key in updates if key not in PROFILE_COLUMNS]
+    unknown = [key for key in updates if key not in WRITABLE_COLUMNS]
     if unknown:
         raise ValueError(f"Refusing to update non-profile columns: {sorted(unknown)}")
 

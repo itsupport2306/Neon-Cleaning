@@ -90,6 +90,7 @@ Key values:
 - `AI_MODEL`: LLM model name when `AI_PROVIDER=openai`.
 - `OPENAI_API_KEY`: API key for optional OpenAI extraction.
 - `AI_EXTRACTOR_ENABLED`: set to `true` to enable model fallback.
+- `WORKER_COUNT`: number of concurrent resume-processing workers. Default `3`.
 - `STATE_FILE`: JSON file used for resumability.
 - `LOG_DIR`: directory for processing logs.
 - `DOWNLOAD_DIR`: local directory for downloaded files.
@@ -294,6 +295,12 @@ To rerun from the latest point:
 
 ```bash
 python -m profile_enrichment.processor --source neon
+```
+
+To run with 3 workers explicitly:
+
+```bash
+python -m profile_enrichment.processor --source neon --workers 3
 ```
 
 To force reprocessing all rows:

@@ -1,6 +1,10 @@
+from pathlib import Path
+
+from profile_enrichment import processor
 from profile_enrichment.extractors import extract_profile_fields_from_text
 from profile_enrichment.neon_db import build_update_map
 from profile_enrichment.processor import _is_reliable_value, sanitize_extracted
+from profile_enrichment.state_manager import StateManager
 
 
 def test_reliable_value_filter_rejects_unknown():
@@ -69,3 +73,53 @@ def test_extract_profile_fields_parses_location_state_code_and_contact_fields():
     assert extracted["state_code"] == "TX"
     assert extracted["specialty"] == "ICU RN"
     assert extracted["email"] == "jane@example.com"
+
+
+def test_process_profile_record_marks_screen_reason_ai_when_qwen_processes(monkeypatch, tmp_path: Path):
+    state = StateManager(str(tmp_path / "state.json"))
+    existing_row = {
+        "profile_id": "abc-123",
+        "first_name": "Jane",
+        "last_name": "Doe",
+        "city": "Austin",
+        "state_code": "TX",
+        "specialty": "ICU RN",
+        "phone": "5551234567",
+        "email": "jane@example.com",
+        "screen_reason": None,
+    }
+    saved_updates = {}
+
+    monkeypatch.setitem(processor.CONFIG, "skip_already_processed", False)
+    monkeypatch.setattr(processor, "download_file_bytes", lambda _: b"%PDF-1.4")
+    monkeypatch.setattr(
+        processor,
+        "extract_text_layers_from_bytes",
+        lambda *args, **kwargs: {
+            "native_text": "Jane Doe resume text",
+            "ocr_text": "",
+            "combined_text": "Jane Doe resume text",
+        },
+    )
+    monkeypatch.setattr(processor, "extract_profile_fields_from_text", lambda _: {})
+    monkeypatch.setattr(processor, "run_ai_extraction", lambda *_: {})
+    monkeypatch.setattr(processor, "sanitize_extracted", lambda extracted, **kwargs: extracted)
+    monkeypatch.setattr(processor, "fetch_profile_by_id", lambda _: existing_row)
+    monkeypatch.setattr(processor, "email_belongs_to_another_profile", lambda *args: False)
+
+    def _capture_update(profile_id, updates):
+        saved_updates["profile_id"] = profile_id
+        saved_updates["updates"] = updates
+
+    monkeypatch.setattr(processor, "update_profile_fields", _capture_update)
+
+    outcome = processor.process_profile_record(
+        {"profile_id": "abc-123", "resume_url": "resume.pdf"},
+        state,
+    )
+
+    assert outcome == "processed"
+    assert saved_updates == {
+        "profile_id": "abc-123",
+        "updates": {"screen_reason": "AI"},
+    }
