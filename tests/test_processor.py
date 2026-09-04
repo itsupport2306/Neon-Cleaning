@@ -123,3 +123,57 @@ def test_process_profile_record_marks_screen_reason_ai_when_qwen_processes(monke
         "profile_id": "abc-123",
         "updates": {"screen_reason": "AI"},
     }
+
+
+def test_process_profile_record_skips_ai_when_missing_fields_are_not_actionable(monkeypatch, tmp_path: Path):
+    state = StateManager(str(tmp_path / "state.json"))
+    existing_row = {
+        "profile_id": "abc-123",
+        "first_name": "Jane",
+        "last_name": "Doe",
+        "city": "Austin",
+        "state_code": "TX",
+        "specialty": None,
+        "phone": "5551234567",
+        "email": "jane@example.com",
+        "screen_reason": None,
+    }
+    saved_updates = {}
+
+    monkeypatch.setitem(processor.CONFIG, "skip_already_processed", False)
+    monkeypatch.setattr(processor, "download_file_bytes", lambda _: b"%PDF-1.4")
+    monkeypatch.setattr(
+        processor,
+        "extract_text_layers_from_bytes",
+        lambda *args, **kwargs: {
+            "native_text": "Profession: ICU RN",
+            "ocr_text": "",
+            "combined_text": "Profession: ICU RN",
+        },
+    )
+    monkeypatch.setattr(processor, "extract_profile_fields_from_text", lambda _: {"specialty": "ICU RN"})
+    monkeypatch.setattr(
+        processor,
+        "run_ai_extraction",
+        lambda *_: (_ for _ in ()).throw(AssertionError("Qwen should not run when only already-filled fields are missing")),
+    )
+    monkeypatch.setattr(processor, "sanitize_extracted", lambda extracted, **kwargs: extracted)
+    monkeypatch.setattr(processor, "email_belongs_to_another_profile", lambda *args: False)
+
+    def _capture_update(profile_id, updates):
+        saved_updates["profile_id"] = profile_id
+        saved_updates["updates"] = updates
+
+    monkeypatch.setattr(processor, "update_profile_fields", _capture_update)
+
+    outcome = processor.process_profile_record(
+        {"profile_id": "abc-123", "resume_url": "resume.pdf"},
+        state,
+        existing=existing_row,
+    )
+
+    assert outcome == "processed"
+    assert saved_updates == {
+        "profile_id": "abc-123",
+        "updates": {"specialty": "ICU RN"},
+    }

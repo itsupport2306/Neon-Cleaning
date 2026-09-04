@@ -7,6 +7,7 @@ import logging
 import os
 import re
 import zipfile
+from functools import lru_cache
 from typing import Any, Dict, List, Optional
 
 from PIL import Image
@@ -70,6 +71,13 @@ def _vision_ocr_base_url() -> Optional[str]:
     return CONFIG["vision_ocr_base_url"] or CONFIG["local_model_base_url"]
 
 
+@lru_cache(maxsize=4)
+def _get_openai_client(base_url: str, api_key: str, timeout: float):
+    from openai import OpenAI
+
+    return OpenAI(base_url=base_url.rstrip("/") + "/", api_key=api_key, timeout=timeout)
+
+
 def _image_to_data_uri(image: Image.Image) -> str:
     rgb_image = image.convert("RGB")
     max_side = CONFIG["vision_ocr_max_image_side"]
@@ -94,10 +102,8 @@ def _qwen_vision_ocr(image: Image.Image) -> str:
         return ""
 
     try:
-        from openai import OpenAI
-
-        client = OpenAI(
-            base_url=base_url.rstrip("/") + "/",
+        client = _get_openai_client(
+            base_url=base_url,
             api_key=CONFIG["vision_ocr_api_key"] or CONFIG["local_model_api_key"] or "local-qwen",
             timeout=CONFIG["vision_ocr_timeout"],
         )
@@ -505,7 +511,7 @@ EXTRACTION_RULES = (
 
 
 def _build_extraction_prompt(text: str) -> str:
-    return EXTRACTION_RULES + text[:16000]
+    return EXTRACTION_RULES + text[: CONFIG["ai_prompt_max_chars"]]
 
 
 def _first_json_object(payload: str) -> Dict[str, Any]:
@@ -620,9 +626,7 @@ def _run_openai_extraction(text: str) -> Dict[str, Any]:
 
 
 def _run_openai_compatible_extraction(base_url: str, api_key: str, model: str, text: str) -> Dict[str, Any]:
-    from openai import OpenAI
-
-    client = OpenAI(base_url=base_url.rstrip("/") + "/", api_key=api_key, timeout=60.0)
+    client = _get_openai_client(base_url=base_url, api_key=api_key, timeout=60.0)
     prompt = _build_extraction_prompt(text)
 
     try:
@@ -647,6 +651,7 @@ def _run_openai_compatible_extraction(base_url: str, api_key: str, model: str, t
     return {k: v for k, v in data.items() if v not in (None, "", " ")}
 
 
+@lru_cache(maxsize=1)
 def _load_local_qwen():
     from llama_cpp import Llama
 

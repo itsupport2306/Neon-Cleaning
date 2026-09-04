@@ -65,7 +65,7 @@ def test_hallucinated_payload_is_discarded(monkeypatch, tmp_path):
         "phone": None,
         "city": None,
     }
-    assert _run(monkeypatch, tmp_path, ai_result, existing, text=MARIA_TEXT) == {}
+    assert _run(monkeypatch, tmp_path, ai_result, existing, text=MARIA_TEXT) == {"screen_reason": "AI"}
 
 
 def test_sentence_fragment_does_not_replace_a_real_name(monkeypatch, tmp_path):
@@ -80,7 +80,7 @@ def test_sentence_fragment_does_not_replace_a_real_name(monkeypatch, tmp_path):
         "phone": None,
         "city": None,
     }
-    assert _run(monkeypatch, tmp_path, ai_result, existing) == {}
+    assert _run(monkeypatch, tmp_path, ai_result, existing) == {"screen_reason": "AI"}
 
 
 def test_values_present_in_the_document_still_get_written(monkeypatch, tmp_path):

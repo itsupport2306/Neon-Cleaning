@@ -3,9 +3,9 @@ from __future__ import annotations
 import csv
 import os
 import threading
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timezone
-from typing import Any, Dict, List, Tuple
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+from datetime import datetime, timedelta, timezone
+from typing import Any, Dict, Iterable, Iterator, List, Tuple
 
 from profile_enrichment import validation
 from profile_enrichment.config import CONFIG
@@ -22,7 +22,8 @@ from profile_enrichment.neon_db import (
     build_update_map,
     email_belongs_to_another_profile,
     fetch_profile_by_id,
-    fetch_profiles_for_reprocessing,
+    fetch_profiles_for_reprocessing_range,
+    fetch_reprocessing_created_at_bounds,
     update_profile_fields,
 )
 from profile_enrichment.state_manager import StateManager
@@ -215,15 +216,108 @@ def _read_csv_rows(csv_path: str) -> List[Dict[str, str]]:
     return rows
 
 
-def _missing_target_fields(extracted: Dict[str, Any]) -> Tuple[str, ...]:
+def _iter_csv_rows(csv_path: str) -> Iterator[Dict[str, str]]:
+    with open(csv_path, newline="", encoding="utf-8") as handle:
+        reader = csv.DictReader(handle)
+        yield from reader
+
+
+def _missing_target_fields(extracted: Dict[str, Any], target_fields: Iterable[str] | None = None) -> Tuple[str, ...]:
     missing = []
-    for field in TARGET_FIELDS:
+    for field in target_fields or TARGET_FIELDS:
         candidate = extracted.get(field)
         if field == "state_code" and not candidate:
             candidate = extracted.get("state")
         if not _normalize_candidate(candidate):
             missing.append(field)
     return tuple(missing)
+
+
+def _parse_created_at_start(value: str) -> datetime:
+    raw = value.strip()
+    if not raw:
+        raise ValueError("CREATED_AT_START must be set in .env when processing Neon rows")
+
+    try:
+        return datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise ValueError(
+            "CREATED_AT_START must be an ISO-like timestamp such as 2026-08-09 19:24:59.563398"
+        ) from exc
+
+
+def _parse_created_at_end(value: str) -> datetime | None:
+    raw = value.strip()
+    if not raw:
+        return None
+
+    try:
+        return datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise ValueError(
+            "CREATED_AT_END must be an ISO-like timestamp such as 2026-08-10 00:00:00"
+        ) from exc
+
+
+def _needed_target_fields(existing_row: Dict[str, Any] | None) -> Tuple[str, ...]:
+    if not existing_row:
+        return TARGET_FIELDS
+    return tuple(field for field in TARGET_FIELDS if not _normalize_candidate(existing_row.get(field)))
+
+
+def _iter_neon_rows(max_rows: int | None = None) -> Iterator[Dict[str, Any]]:
+    start_created_at = _parse_created_at_start(CONFIG["created_at_start"])
+    end_created_at = _parse_created_at_end(CONFIG["created_at_end"])
+    _, max_created_at = fetch_reprocessing_created_at_bounds(start_created_at)
+    if max_created_at is None:
+        return
+
+    final_end = end_created_at or (max_created_at + timedelta(microseconds=1))
+    if final_end <= start_created_at:
+        raise ValueError("CREATED_AT_END must be later than CREATED_AT_START")
+
+    window_size = timedelta(days=CONFIG["created_at_partition_days"])
+    batch_size = CONFIG["db_fetch_batch_size"]
+    remaining = max_rows
+    window_start = start_created_at
+
+    while window_start < final_end and (remaining is None or remaining > 0):
+        window_end = min(window_start + window_size, final_end)
+        logger.info(
+            "NEON_PARTITION_START | created_at_from=%s | created_at_to=%s | batch_size=%s",
+            window_start,
+            window_end,
+            batch_size,
+        )
+
+        last_created_at = None
+        last_profile_id = None
+        while remaining is None or remaining > 0:
+            fetch_limit = remaining if remaining is not None else None
+            rows = fetch_profiles_for_reprocessing_range(
+                start_created_at=window_start,
+                end_created_at=window_end,
+                batch_size=batch_size,
+                last_created_at=last_created_at,
+                last_profile_id=last_profile_id,
+                limit=fetch_limit,
+            )
+            if not rows:
+                break
+
+            for row in rows:
+                yield row
+                if remaining is not None:
+                    remaining -= 1
+                    if remaining <= 0:
+                        return
+
+            last_created_at = rows[-1].get("created_at")
+            last_profile_id = _normalize_candidate(rows[-1].get("profile_id"))
+            if len(rows) < batch_size:
+                break
+
+        window_start = window_end
 
 
 def process_profile_record(
@@ -242,6 +336,13 @@ def process_profile_record(
         state.mark_skipped(profile_id)
         logger.info("SKIPPED_ALREADY_PROCESSED | profile_id=%s", profile_id)
         return "skipped"
+
+    existing_row = existing
+    needed_target_fields = _needed_target_fields(existing_row if not comprehensive_reprocess else None)
+    if existing_row and not comprehensive_reprocess and not needed_target_fields:
+        logger.info("SKIPPED_NO_ACTIONABLE_GAPS | profile_id=%s", profile_id)
+        state.mark_processed(profile_id)
+        return "processed"
 
     file_ref = (
         row.get("resume_url")
@@ -292,7 +393,7 @@ def process_profile_record(
         profile_id=profile_id,
         require_grounding=True,
     )
-    missing_before_ai = _missing_target_fields(extracted)
+    missing_before_ai = _missing_target_fields(extracted, needed_target_fields)
     ai_processed = False
 
     try:
@@ -300,7 +401,7 @@ def process_profile_record(
             ai_extracted = run_ai_extraction(None, combined_text) if combined_text.strip() else {}
             ai_processed = bool(combined_text.strip())
         else:
-            should_run_ai = missing_before_ai or not combined_text.strip()
+            should_run_ai = bool(missing_before_ai)
             ai_extracted = run_ai_extraction(None, combined_text) if should_run_ai else {}
             ai_processed = bool(should_run_ai)
     except Exception as exc:  # pragma: no cover - exercised in runtime only
@@ -323,12 +424,13 @@ def process_profile_record(
         state.mark_skipped(profile_id)
         return "skipped"
 
-    try:
-        existing_row = existing or fetch_profile_by_id(profile_id)
-    except Exception as exc:  # pragma: no cover - exercised in runtime only
-        logger.exception("NEONDB_QUERY_FAILURE | profile_id=%s | error=%s", profile_id, exc)
-        state.mark_failed(profile_id)
-        return "failed"
+    if existing_row is None:
+        try:
+            existing_row = fetch_profile_by_id(profile_id)
+        except Exception as exc:  # pragma: no cover - exercised in runtime only
+            logger.exception("NEONDB_QUERY_FAILURE | profile_id=%s | error=%s", profile_id, exc)
+            state.mark_failed(profile_id)
+            return "failed"
 
     if not existing_row:
         logger.error("PROFILE_NOT_FOUND | profile_id=%s", profile_id)
@@ -415,9 +517,9 @@ def run_enrichment(
     state.set_last_run(datetime.now(timezone.utc).isoformat())
 
     if source_name == "csv":
-        rows: List[Dict[str, Any]] = _read_csv_rows(csv_path or CONFIG["csv_path"])
+        rows: Iterable[Dict[str, Any]] = _iter_csv_rows(csv_path or CONFIG["csv_path"])
     elif source_name == "neon":
-        rows = fetch_profiles_for_reprocessing(limit=max_rows)
+        rows = _iter_neon_rows(max_rows=max_rows)
     else:
         raise ValueError(f"Unsupported source: {source_name}")
 
@@ -428,40 +530,55 @@ def run_enrichment(
     processed = 0
     skipped = 0
 
-    candidate_rows: List[Dict[str, Any]] = []
-    for row in rows:
-        if source_name == "csv" and max_rows is not None and len(candidate_rows) >= max_rows:
-            break
-        profile_id = _normalize_candidate(row.get("profile_id"))
-        if not profile_id:
-            continue
+    row_iter = iter(rows)
+    active_futures = {}
+    source_limit = max_rows if source_name == "csv" else None
+    source_rows_seen = 0
 
-        if CONFIG["skip_already_processed"] and state.is_processed(profile_id):
-            total_rows += 1
-            skipped += 1
-            continue
+    try:
+        with ThreadPoolExecutor(max_workers=worker_count) as executor:
+            while True:
+                while len(active_futures) < worker_count:
+                    if source_limit is not None and source_rows_seen >= source_limit:
+                        break
+                    try:
+                        row = next(row_iter)
+                    except StopIteration:
+                        break
 
-        candidate_rows.append(row)
-        total_rows += 1
+                    source_rows_seen += 1
+                    profile_id = _normalize_candidate(row.get("profile_id"))
+                    if not profile_id:
+                        continue
 
-    with ThreadPoolExecutor(max_workers=worker_count) as executor:
-        futures = [
-            executor.submit(
-                process_profile_record,
-                row,
-                state,
-                existing=(row if source_name == "neon" else None),
-                comprehensive_reprocess=comprehensive_reprocess,
-                disable_ocr=disable_ocr,
-            )
-            for row in candidate_rows
-        ]
-        for future in as_completed(futures):
-            outcome = future.result()
-            if outcome == "processed":
-                processed += 1
-            elif outcome == "skipped":
-                skipped += 1
+                    total_rows += 1
+                    if CONFIG["skip_already_processed"] and state.is_processed(profile_id):
+                        skipped += 1
+                        continue
+
+                    future = executor.submit(
+                        process_profile_record,
+                        row,
+                        state,
+                        existing=(row if source_name == "neon" else None),
+                        comprehensive_reprocess=comprehensive_reprocess,
+                        disable_ocr=disable_ocr,
+                    )
+                    active_futures[future] = profile_id
+
+                if not active_futures:
+                    break
+
+                done, _ = wait(tuple(active_futures), return_when=FIRST_COMPLETED)
+                for future in done:
+                    active_futures.pop(future, None)
+                    outcome = future.result()
+                    if outcome == "processed":
+                        processed += 1
+                    elif outcome == "skipped":
+                        skipped += 1
+    finally:
+        state.flush()
 
     return {
         "source": source_name,
@@ -470,6 +587,9 @@ def run_enrichment(
         "processed": processed,
         "skipped": skipped,
         "worker_count": worker_count,
+        "created_at_start": CONFIG["created_at_start"] if source_name == "neon" else None,
+        "created_at_end": CONFIG["created_at_end"] if source_name == "neon" else None,
+        "created_at_partition_days": CONFIG["created_at_partition_days"] if source_name == "neon" else None,
         "no_text_extracted": _no_useful_information_count,
         "state_file": str(state.state_path),
     }

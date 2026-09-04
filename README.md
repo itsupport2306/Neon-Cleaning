@@ -8,7 +8,7 @@ The goal is not to create a new extraction pipeline from scratch. It is a safe P
 
 The workflow is:
 
-1. Query NeonDB for rows where `specialty`, `state_code`, `email`, and `phone` are all `NULL`.
+1. Query NeonDB for candidate rows starting at `CREATED_AT_START`, partitioned by `created_at` time windows.
 2. For each row, read the Cloudflare reference such as `/files/resumes/import/...` or a direct public URL.
 3. Download the file from Cloudflare.
 4. Extract native text from the file where possible.
@@ -18,6 +18,7 @@ The workflow is:
 8. Match by `profile_id` to the existing NeonDB record.
 9. Update only missing fields with strong evidence.
 10. Log every outcome and keep resumable progress in a JSON state file.
+11. Keep exactly three concurrent workers by default, with bounded in-flight tasks and batched state flushes for higher throughput.
 
 ## Project structure
 
@@ -86,6 +87,10 @@ Key values:
 - `NEON_DB_URL`: direct Postgres connection string for NeonDB.
 - `NEON_TABLE_NAME`: table holding the profile rows.
 - `NEON_REPROCESS_QUERY`: query used to fetch candidate rows for reprocessing.
+- `CREATED_AT_START`: first `created_at` timestamp to process, for example `2026-08-09 19:24:59.563398`.
+- `CREATED_AT_END`: last `created_at` boundary for the run, for example `2026-08-10 00:00:00`. If omitted, the run continues to the newest matching row.
+- `CREATED_AT_PARTITION_DAYS`: size of each internal `created_at` partition window in days. Default `1`.
+- `DB_FETCH_BATCH_SIZE`: number of rows fetched per Neon round-trip inside each time window. Default `250`.
 - `AI_PROVIDER`: `local_qwen` by default. `openai` is still supported.
 - `AI_MODEL`: LLM model name when `AI_PROVIDER=openai`.
 - `OPENAI_API_KEY`: API key for optional OpenAI extraction.
@@ -95,11 +100,14 @@ Key values:
 - `LOG_DIR`: directory for processing logs.
 - `DOWNLOAD_DIR`: local directory for downloaded files.
 - `SKIP_ALREADY_PROCESSED`: set to `true` to avoid reprocessing already completed rows.
+- `WORKER_COUNT`: concurrent workers. Default `3`.
+- `STATE_SAVE_EVERY`: save the resumable state file every N changes instead of every profile. Default `50`.
 - `OCR_ENABLED`: enables Tesseract OCR for PDFs, images, and DOCX embedded images.
 - `TESSERACT_CMD`: path to the Tesseract executable if it is not on `PATH`.
 - `LOCAL_MODEL_REPO_ID`: default Hugging Face repo for the GGUF model.
 - `LOCAL_MODEL_FILENAME`: GGUF filename or glob pattern, such as `*Q4_K_M.gguf`.
 - `LOCAL_MODEL_PATH`: local path to a pre-downloaded GGUF file. If omitted, the app can download from Hugging Face through `llama-cpp-python`.
+- `AI_PROMPT_MAX_CHARS`: max resume text sent to the extraction model per profile. Default `12000`.
 
 ## Cloudflare configuration
 
@@ -310,6 +318,8 @@ python -m profile_enrichment.processor --source neon --no-skip-processed
 ```
 
 ## Running the enrichment job
+
+For Neon processing, the runtime now reads `CREATED_AT_START` and optional `CREATED_AT_END` from `.env` and walks the table in ordered `created_at` windows. Within each window it uses batched fetches and keeps only `WORKER_COUNT` active tasks in flight, so Qwen stays busy without loading the entire candidate set into memory.
 
 ```bash
 python -m profile_enrichment.processor --source neon --limit 100

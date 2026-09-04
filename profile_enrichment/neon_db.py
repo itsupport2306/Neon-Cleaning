@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 from profile_enrichment.config import CONFIG
@@ -36,6 +37,53 @@ def fetch_profiles_for_reprocessing(limit: int | None = None) -> List[Dict[str, 
     with get_connection() as conn:
         with conn.cursor() as cursor:
             cursor.execute(sql, params)
+            rows = cursor.fetchall()
+            columns = [desc[0] for desc in cursor.description]
+            return [dict(zip(columns, row)) for row in rows]
+
+
+def fetch_reprocessing_created_at_bounds(start_created_at: datetime) -> tuple[Optional[datetime], Optional[datetime]]:
+    sql = (
+        "SELECT MIN(created_at), MAX(created_at) "
+        f"FROM ({CONFIG['neon_reprocess_query'].strip().rstrip(';')}) AS candidate_rows "
+        "WHERE created_at >= %s;"
+    )
+    with get_connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(sql, (start_created_at,))
+            row = cursor.fetchone()
+            if not row:
+                return None, None
+            return row[0], row[1]
+
+
+def fetch_profiles_for_reprocessing_range(
+    start_created_at: datetime,
+    end_created_at: datetime,
+    batch_size: int,
+    last_created_at: datetime | None = None,
+    last_profile_id: str | None = None,
+    limit: int | None = None,
+) -> List[Dict[str, Any]]:
+    sql = [
+        f"SELECT * FROM ({CONFIG['neon_reprocess_query'].strip().rstrip(';')}) AS candidate_rows",
+        "WHERE profile_id IS NOT NULL",
+        "AND created_at >= %s",
+        "AND created_at < %s",
+    ]
+    params: List[Any] = [start_created_at, end_created_at]
+
+    if last_created_at is not None and last_profile_id is not None:
+        sql.append("AND (created_at > %s OR (created_at = %s AND profile_id > %s))")
+        params.extend([last_created_at, last_created_at, last_profile_id])
+
+    sql.append("ORDER BY created_at ASC, profile_id ASC")
+    sql.append("LIMIT %s")
+    params.append(min(batch_size, limit) if limit is not None else batch_size)
+
+    with get_connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute("\n".join(sql), tuple(params))
             rows = cursor.fetchall()
             columns = [desc[0] for desc in cursor.description]
             return [dict(zip(columns, row)) for row in rows]

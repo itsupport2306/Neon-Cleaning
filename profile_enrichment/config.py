@@ -35,6 +35,11 @@ CONFIG = {
     "ai_extractor_enabled": get_bool("AI_EXTRACTOR_ENABLED", True),
     "process_limit": int(os.getenv("PROCESS_LIMIT", "0") or 0),
     "worker_count": max(1, int(os.getenv("WORKER_COUNT", "3") or 3)),
+    "created_at_start": os.getenv("CREATED_AT_START", "").strip(),
+    "created_at_end": os.getenv("CREATED_AT_END", "").strip(),
+    "created_at_partition_days": max(1, int(os.getenv("CREATED_AT_PARTITION_DAYS", "1") or 1)),
+    "db_fetch_batch_size": max(1, int(os.getenv("DB_FETCH_BATCH_SIZE", "250") or 250)),
+    "state_save_every": max(1, int(os.getenv("STATE_SAVE_EVERY", "50") or 50)),
     "state_file": os.getenv("STATE_FILE", str(ROOT_DIR / "state" / "enrichment_state.json")),
     "log_dir": os.getenv("LOG_DIR", str(ROOT_DIR / "logs")),
     "download_dir": os.getenv("DOWNLOAD_DIR", str(ROOT_DIR / "downloads")),
@@ -63,4 +68,5 @@ CONFIG = {
     "local_model_dir": os.getenv("LOCAL_MODEL_DIR", str(ROOT_DIR / "models")),
     "local_model_n_ctx": int(os.getenv("LOCAL_MODEL_N_CTX", "8192") or 8192),
     "local_model_max_tokens": int(os.getenv("LOCAL_MODEL_MAX_TOKENS", "512") or 512),
+    "ai_prompt_max_chars": max(1000, int(os.getenv("AI_PROMPT_MAX_CHARS", "12000") or 12000)),
 }
