@@ -91,10 +91,7 @@ Key values:
 - `CREATED_AT_END`: last `created_at` boundary for the run, for example `2026-08-10 00:00:00`. If omitted, the run continues to the newest matching row.
 - `CREATED_AT_PARTITION_DAYS`: size of each internal `created_at` partition window in days. Default `1`.
 - `DB_FETCH_BATCH_SIZE`: number of rows fetched per Neon round-trip inside each time window. Default `250`.
-- `AI_PROVIDER`: `local_qwen` by default. `openai` is still supported.
-- `AI_MODEL`: LLM model name when `AI_PROVIDER=openai`.
-- `OPENAI_API_KEY`: API key for optional OpenAI extraction.
-- `AI_EXTRACTOR_ENABLED`: set to `true` to enable model fallback.
+- `AI_EXTRACTOR_ENABLED`: set to `true` to enable the Qwen model fallback.
 - `WORKER_COUNT`: number of concurrent resume-processing workers. Default `3`.
 - `STATE_FILE`: JSON file used for resumability.
 - `LOG_DIR`: directory for processing logs.
@@ -150,7 +147,7 @@ Then it updates only missing fields with useful extracted data.
 
 ## AI model configuration
 
-Model fallback is optional and runs only when OCR plus regex extraction still misses one or more of the target fields: `specialty`, `state_code`, `email`, or `phone`.
+By default, Qwen only runs when OCR plus regex extraction still misses one or more of the target fields: `specialty`, `state_code`, `email`, or `phone`. With `--reprocess-all` / `--comprehensive`, Qwen runs on every row's full document text regardless of what is already stored - including rows already marked `screen_reason = "AI"` - because a previous AI pass is not treated as proof the row is clean.
 
 The default local fallback is `Qwen/Qwen2.5-1.5B-Instruct-GGUF`. The most reliable Windows setup is to run a local `llama.cpp` server and point the app at it with `LOCAL_MODEL_BASE_URL` and `LOCAL_MODEL_NAME`.
 
@@ -162,7 +159,7 @@ llama serve -hf Qwen/Qwen2.5-1.5B-Instruct-GGUF:Q4_K_M
 
 If you already have a local GGUF runtime embedded in Python, you can still use `LOCAL_MODEL_PATH` or the Hugging Face repo settings.
 
-If `AI_PROVIDER=openai` and `OPENAI_API_KEY` is present, the app sends the extracted document text to the configured OpenAI model and asks for a small JSON payload containing:
+Qwen is asked for a small JSON payload containing:
 
 - `first_name`
 - `last_name`
@@ -173,6 +170,8 @@ If `AI_PROVIDER=openai` and `OPENAI_API_KEY` is present, the app sends the extra
 - `email`
 
 If the model call fails, the process keeps the OCR/text result and continues instead of stopping the full batch.
+
+There is no OpenAI (or any other cloud LLM) provider in this pipeline - Qwen, served locally or via `LOCAL_MODEL_BASE_URL`, is the only extraction model.
 
 ## Source format
 
@@ -261,7 +260,9 @@ This checks each field and only includes it if it passes the validation rules an
 
 ## Logging and error handling
 
-The app writes logs to the console and to `logs/enrichment.log`.
+The app writes logs to the console and to `logs/enrichment.log`. Every row that is
+skipped or fails prints its reason to the terminal, not only to the log file - no
+row is ever silently dropped.
 
 It tracks:
 
@@ -276,7 +277,7 @@ Examples:
 
 - `START_PROCESSING | profile_id=...`
 - `SUCCESSFUL_UPDATE | profile_id=... | updated_fields=[...]`
-- `NO_USEFUL_INFORMATION | profile_id=... | reason=...`
+- `SKIPPED_ROW | profile_id=... | reason=...`
 - `CLOUDFLARE_DOWNLOAD_FAILURE | profile_id=...`
 - `NEONDB_UPDATE_FAILURE | profile_id=...`
 

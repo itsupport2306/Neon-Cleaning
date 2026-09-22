@@ -601,30 +601,6 @@ def extract_profile_fields_from_text(text: str) -> Dict[str, Any]:
     return extracted
 
 
-def _run_openai_extraction(text: str) -> Dict[str, Any]:
-    from openai import OpenAI
-
-    api_key = CONFIG["openai_api_key"]
-    if not api_key:
-        raise ValueError("OPENAI_API_KEY is not configured")
-
-    client = OpenAI(api_key=api_key)
-
-    response = client.chat.completions.create(
-        model=CONFIG["ai_model"],
-        messages=[
-            {"role": "system", "content": EXTRACTION_SYSTEM_PROMPT},
-            {"role": "user", "content": _build_extraction_prompt(text)},
-        ],
-        temperature=0,
-        max_tokens=800,
-    )
-
-    content = response.choices[0].message.content or "{}"
-    data = _first_json_object(content)
-    return {k: v for k, v in data.items() if v not in (None, "", " ")}
-
-
 def _run_openai_compatible_extraction(base_url: str, api_key: str, model: str, text: str) -> Dict[str, Any]:
     client = _get_openai_client(base_url=base_url, api_key=api_key, timeout=60.0)
     prompt = _build_extraction_prompt(text)
@@ -718,12 +694,7 @@ def run_ai_extraction(document_path: str, text: str) -> Dict[str, Any]:
     if not CONFIG["ai_extractor_enabled"] or not text.strip():
         return {}
 
-    provider = (CONFIG["ai_provider"] or "").strip().lower()
-    if provider == "openai":
-        return _run_openai_extraction(text)
-    if provider in {"local_qwen", "qwen", "llama_cpp"}:
-        return _run_local_qwen_extraction(text)
-    raise ValueError(f"Unsupported AI_PROVIDER: {CONFIG['ai_provider']}")
+    return _run_local_qwen_extraction(text)
 
 
 def combine_extracted_values(base: Dict[str, Any], extra: Dict[str, Any]) -> Dict[str, Any]:

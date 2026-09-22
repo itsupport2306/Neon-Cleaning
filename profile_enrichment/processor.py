@@ -200,11 +200,11 @@ _no_useful_information_lock = threading.Lock()
 
 
 def _log_no_useful_information(profile_id: str, reason: str) -> None:
-    """Logged to the file only; the terminal gets the run-end count instead."""
+    """Every skipped/failed row must say why on the terminal, not just in the log file."""
     global _no_useful_information_count
     with _no_useful_information_lock:
         _no_useful_information_count += 1
-    logger.info("NO_USEFUL_INFORMATION | profile_id=%s | reason=%s", profile_id, reason)
+    logger.warning("SKIPPED_ROW | profile_id=%s | reason=%s", profile_id, reason)
 
 
 def _read_csv_rows(csv_path: str) -> List[Dict[str, str]]:
@@ -332,7 +332,7 @@ def process_profile_record(
         logger.warning("MISSING_PROFILE_ID | row=%s", row)
         return "invalid"
 
-    if CONFIG["skip_already_processed"] and state.is_processed(profile_id):
+    if not comprehensive_reprocess and CONFIG["skip_already_processed"] and state.is_processed(profile_id):
         state.mark_skipped(profile_id)
         logger.info("SKIPPED_ALREADY_PROCESSED | profile_id=%s", profile_id)
         return "skipped"
@@ -552,7 +552,7 @@ def run_enrichment(
                         continue
 
                     total_rows += 1
-                    if CONFIG["skip_already_processed"] and state.is_processed(profile_id):
+                    if not comprehensive_reprocess and CONFIG["skip_already_processed"] and state.is_processed(profile_id):
                         skipped += 1
                         continue
 

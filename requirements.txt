@@ -9,5 +9,5 @@ pytesseract>=0.3.10
 Pillow>=10.4.0
 pytest>=8.3.0
 
-# Optional for AI-assisted parsing
+# OpenAI-compatible client SDK, used to talk to the local Qwen server (not the OpenAI cloud API)
 openai>=1.40.0

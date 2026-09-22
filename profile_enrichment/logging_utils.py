@@ -26,8 +26,8 @@ class ConsoleFormatter(logging.Formatter):
             record.exc_info, record.exc_text, record.stack_info = saved_exc_info, saved_exc_text, saved_stack
 
 
-# Events that are useful in the log file but only add noise to the terminal.
-CONSOLE_SUPPRESSED_EVENTS = ("NO_USEFUL_INFORMATION",)
+# Every skipped/failed row must explain itself on the terminal, so nothing is suppressed here.
+CONSOLE_SUPPRESSED_EVENTS: tuple[str, ...] = ()
 
 
 class ConsoleNoiseFilter(logging.Filter):
