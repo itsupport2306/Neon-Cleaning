@@ -134,11 +134,18 @@ def update_profile_fields(profile_id: str, updates: Dict[str, Any]) -> None:
     assignments = []
     parameters = []
     for key, value in updates.items():
-        assignments.append(f'"{key}" = %s')
+        if key == "phone":
+            assignments.append('"phone" = CASE WHEN "phone" IS NULL THEN %s ELSE "phone" END')
+        else:
+            assignments.append(f'"{key}" = %s')
         parameters.append(value)
     parameters.append(profile_id)
 
-    sql = f"UPDATE {table_name} SET {', '.join(assignments)} WHERE profile_id = %s;"
+    where_clause = "profile_id = %s"
+    if set(updates) == {"phone"}:
+        where_clause += ' AND "phone" IS NULL'
+
+    sql = f"UPDATE {table_name} SET {', '.join(assignments)} WHERE {where_clause};"
     with get_connection() as conn:
         with conn.cursor() as cursor:
             cursor.execute(sql, tuple(parameters))
@@ -159,7 +166,10 @@ def build_update_map(existing: Dict[str, Any], extracted: Dict[str, Any]) -> Dic
 
     for db_field in PROFILE_COLUMNS:
         current_value = existing.get(db_field)
-        if current_value not in (None, "", " "):
+        if db_field == "phone":
+            if current_value is not None:
+                continue
+        elif current_value not in (None, "", " "):
             continue
 
         for candidate_field in field_aliases[db_field]:

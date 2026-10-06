@@ -95,10 +95,12 @@ def _verify_and_merge_fields(
     only whether the database should change at all:
 
     * empty column + verified value -> fill it in
+    * phone is stricter: only NULL + verified value -> fill it in
     * populated column that the document does NOT confirm -> overwrite
     * populated column that the document DOES confirm -> leave it alone
 
     That last rule is what keeps `Patrick Vrtis` from becoming `I'm Patrick`.
+    The phone exception avoids needless writes and never replaces a stored phone.
     """
     updates: Dict[str, Any] = {}
     changes: Dict[str, str] = {}
@@ -108,6 +110,16 @@ def _verify_and_merge_fields(
         extracted_clean = _extracted_value_for(field, extracted)
 
         if not extracted_clean:
+            continue
+
+        if field == "phone" and existing.get(field) is not None:
+            logger.info(
+                "FIELD_KEPT | profile_id=%s | field=%s | value=%s | candidate=%s | reason=phone_not_null",
+                profile_id,
+                field,
+                existing_clean,
+                extracted_clean,
+            )
             continue
 
         if not existing_clean:

@@ -1,9 +1,9 @@
 from pathlib import Path
 
-from profile_enrichment import processor
+from profile_enrichment import neon_db, processor
 from profile_enrichment.extractors import extract_profile_fields_from_text
-from profile_enrichment.neon_db import build_update_map
-from profile_enrichment.processor import _is_reliable_value, sanitize_extracted
+from profile_enrichment.neon_db import build_update_map, update_profile_fields
+from profile_enrichment.processor import _is_reliable_value, _verify_and_merge_fields, sanitize_extracted
 from profile_enrichment.state_manager import StateManager
 
 
@@ -56,6 +56,91 @@ def test_build_update_map_only_fills_blank_columns():
         "specialty": "Cardiology",
         "phone": "5551234567",
     }
+
+
+def test_build_update_map_only_fills_phone_when_null():
+    existing = {
+        "first_name": None,
+        "last_name": None,
+        "city": None,
+        "state_code": None,
+        "specialty": None,
+        "phone": "",
+        "email": None,
+    }
+    extracted = {"phone": "5551234567"}
+
+    assert "phone" not in build_update_map(existing, extracted)
+
+
+def test_comprehensive_merge_does_not_overwrite_non_null_phone(monkeypatch):
+    monkeypatch.setitem(processor.CONFIG, "allow_overwrite_existing", True)
+    existing = {"phone": "5550000000"}
+    extracted = {"phone": "5551234567"}
+
+    updates, changes = _verify_and_merge_fields(
+        "abc-123",
+        existing,
+        extracted,
+        source_text="Phone: 555-123-4567",
+    )
+
+    assert "phone" not in updates
+    assert "phone" not in changes
+
+
+def test_comprehensive_merge_fills_null_phone_from_resume(monkeypatch):
+    monkeypatch.setitem(processor.CONFIG, "allow_overwrite_existing", True)
+    existing = {"phone": None}
+    extracted = {"phone": "5551234567"}
+
+    updates, changes = _verify_and_merge_fields(
+        "abc-123",
+        existing,
+        extracted,
+        source_text="Phone: 555-123-4567",
+    )
+
+    assert updates["phone"] == "5551234567"
+    assert changes["phone"] == "<empty> -> 5551234567"
+
+
+def test_update_profile_fields_guards_phone_only_update_at_sql_level(monkeypatch):
+    executed = {}
+
+    class FakeCursor:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return None
+
+        def execute(self, sql, params):
+            executed["sql"] = sql
+            executed["params"] = params
+
+    class FakeConnection:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return None
+
+        def cursor(self):
+            return FakeCursor()
+
+        def commit(self):
+            executed["committed"] = True
+
+    monkeypatch.setitem(neon_db.CONFIG, "neon_table_name", "profiles")
+    monkeypatch.setattr(neon_db, "get_connection", lambda: FakeConnection())
+
+    update_profile_fields("abc-123", {"phone": "5551234567"})
+
+    assert '"phone" = CASE WHEN "phone" IS NULL THEN %s ELSE "phone" END' in executed["sql"]
+    assert 'WHERE profile_id = %s AND "phone" IS NULL;' in executed["sql"]
+    assert executed["params"] == ("5551234567", "abc-123")
+    assert executed["committed"] is True
 
 
 def test_extract_profile_fields_parses_location_state_code_and_contact_fields():

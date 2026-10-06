@@ -238,6 +238,10 @@ confirm what is stored and the new value is fully verified. If the resume shows
 `--no-overwrite` (or set `ALLOW_OVERWRITE_EXISTING=false`) to fill blanks only and
 never touch a populated column.
 
+`phone` is stricter: it is only written when the existing database value is `NULL`
+and the resume contains a verified phone number. Existing non-`NULL` phone values
+are never replaced.
+
 An empty field is an acceptable outcome. A fabricated field is not.
 
 ## `profile_id` matching and update logic
