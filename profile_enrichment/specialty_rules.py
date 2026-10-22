@@ -80,6 +80,12 @@ def build_specialty_fix_sql(table_name: str) -> str:
     Filtering happens in SQL so the database only hands back the rows that
     actually need a resume reprocessed, instead of every row with a non-empty
     specialty.
+
+    This string is later executed through psycopg2 together with bound
+    parameters (e.g. `... LIMIT %s`), so every literal `%` in it - such as the
+    one in the email regex's character class - must be escaped as `%%` or
+    psycopg2's parameter substitution miscounts placeholders and raises
+    `IndexError: tuple index out of range`.
     """
     junk_array = _sql_string_array(JUNK_VALUES)
     names_array = _sql_string_array(COMMON_FIRST_NAMES)
@@ -89,7 +95,7 @@ def build_specialty_fix_sql(table_name: str) -> str:
         "  AND specialty !~ '^\\s*$'\n"
         "  AND (\n"
         f"    lower(btrim(specialty)) = ANY ({junk_array})\n"
-        "    OR specialty ~* '[a-z0-9._%+-]+@[a-z0-9.-]+\\.[a-z]{2,}'\n"
+        "    OR specialty ~* '[a-z0-9._%%+-]+@[a-z0-9.-]+\\.[a-z]{2,}'\n"
         "    OR specialty ~* 'https?://|www\\.'\n"
         "    OR specialty ~* '\\b[a-z0-9-]+\\.(com|net|org|io|co|gov|edu)\\b'\n"
         "    OR specialty ~ '(?:\\d[\\s.\\-()]*){7,}\\d'\n"
