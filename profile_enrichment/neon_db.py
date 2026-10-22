@@ -90,7 +90,7 @@ def fetch_profiles_for_reprocessing_range(
 
 
 def fetch_profiles_with_candidate_specialty(limit: int | None = None) -> List[Dict[str, Any]]:
-    """Broad fetch of rows with a non-empty specialty; callers filter for suspicious values themselves."""
+    """One-shot fetch of rows `NEON_SPECIALTY_FIX_QUERY` flags as suspicious."""
     sql = CONFIG["neon_specialty_fix_query"].strip().rstrip(";")
     if limit is not None:
         sql = f"{sql} LIMIT %s"
@@ -101,6 +101,43 @@ def fetch_profiles_with_candidate_specialty(limit: int | None = None) -> List[Di
     with get_connection() as conn:
         with conn.cursor() as cursor:
             cursor.execute(sql, params)
+            rows = cursor.fetchall()
+            columns = [desc[0] for desc in cursor.description]
+            return [dict(zip(columns, row)) for row in rows]
+
+
+def count_profiles_with_candidate_specialty() -> int:
+    """How many rows `NEON_SPECIALTY_FIX_QUERY` flags, without fetching their columns."""
+    sql = CONFIG["neon_specialty_fix_query"].strip().rstrip(";")
+    with get_connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(f"SELECT count(*) FROM ({sql}) AS candidate_rows;")
+            return cursor.fetchone()[0]
+
+
+def fetch_profiles_with_candidate_specialty_page(
+    batch_size: int,
+    last_profile_id: str | None = None,
+    limit: int | None = None,
+) -> List[Dict[str, Any]]:
+    """Keyset-paginated fetch so a large number of flagged rows is never held in memory at once."""
+    sql = [
+        f"SELECT * FROM ({CONFIG['neon_specialty_fix_query'].strip().rstrip(';')}) AS candidate_rows",
+        "WHERE profile_id IS NOT NULL",
+    ]
+    params: List[Any] = []
+
+    if last_profile_id is not None:
+        sql.append("AND profile_id > %s")
+        params.append(last_profile_id)
+
+    sql.append("ORDER BY profile_id ASC")
+    sql.append("LIMIT %s")
+    params.append(min(batch_size, limit) if limit is not None else batch_size)
+
+    with get_connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute("\n".join(sql), tuple(params))
             rows = cursor.fetchall()
             columns = [desc[0] for desc in cursor.description]
             return [dict(zip(columns, row)) for row in rows]

@@ -2,13 +2,12 @@ from __future__ import annotations
 
 import csv
 import os
-import re
 import threading
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Iterable, Iterator, List, Tuple
 
-from profile_enrichment import validation
+from profile_enrichment import specialty_rules, validation
 from profile_enrichment.config import CONFIG
 from profile_enrichment.downloaders import download_file_bytes
 from profile_enrichment.extractors import (
@@ -21,10 +20,11 @@ from profile_enrichment.logging_utils import setup_logger
 from profile_enrichment.neon_db import (
     PROFILE_COLUMNS,
     build_update_map,
+    count_profiles_with_candidate_specialty,
     email_belongs_to_another_profile,
     fetch_profile_by_id,
     fetch_profiles_for_reprocessing_range,
-    fetch_profiles_with_candidate_specialty,
+    fetch_profiles_with_candidate_specialty_page,
     fetch_reprocessing_created_at_bounds,
     update_profile_fields,
     update_specialty_only,
@@ -280,74 +280,67 @@ def _needed_target_fields(existing_row: Dict[str, Any] | None) -> Tuple[str, ...
     return tuple(field for field in TARGET_FIELDS if not _normalize_candidate(existing_row.get(field)))
 
 
-_SPECIALTY_JUNK_VALUES = {"web", "n/a", "na", "none", "unknown", "test", "-", "."}
-_SPECIALTY_EMAIL_RE = re.compile(r"[\w.+-]+@[\w-]+\.[a-z]{2,}", re.IGNORECASE)
-_SPECIALTY_DOMAIN_RE = re.compile(r"\b[\w-]+\.(com|net|org|io|co|gov|edu)\b", re.IGNORECASE)
-_SPECIALTY_URL_RE = re.compile(r"https?://|www\.", re.IGNORECASE)
-_SPECIALTY_PHONE_RE = re.compile(r"(?:\d[\s.\-()]*){7,}\d")
-_SPECIALTY_NAME_PREFIX_RE = re.compile(r"^\s*([A-Za-z]+)\s*[.,]\s*\S")
-# A small set of common first names used only to tell "John, Cardiology" (a name
-# prefix to strip) apart from a legitimate specialty that happens to contain a
-# comma or period, like "Pediatrics, General".
-_COMMON_FIRST_NAMES = {
-    "james", "john", "robert", "michael", "william", "david", "richard", "joseph",
-    "thomas", "charles", "christopher", "daniel", "matthew", "anthony", "mark",
-    "donald", "steven", "paul", "andrew", "joshua", "kenneth", "kevin", "brian",
-    "george", "timothy", "ronald", "edward", "jason", "jeffrey", "ryan", "jacob",
-    "gary", "nicholas", "eric", "jonathan", "stephen", "larry", "justin", "scott",
-    "brandon", "benjamin", "samuel", "frank", "raymond", "patrick", "alexander",
-    "jack", "dennis", "jerry", "mary", "patricia", "jennifer", "linda", "elizabeth",
-    "barbara", "susan", "jessica", "sarah", "karen", "nancy", "lisa", "margaret",
-    "betty", "sandra", "ashley", "kimberly", "emily", "donna", "michelle", "carol",
-    "amanda", "melissa", "deborah", "stephanie", "rebecca", "laura", "sharon",
-    "cynthia", "kathleen", "amy", "angela", "shirley", "anna", "ruth", "brenda",
-    "pamela", "nicole", "katherine", "samantha", "christine", "emma", "catherine",
-    "debra", "virginia", "rachel", "carolyn", "janet", "maria", "heather", "diane",
-    "julie", "joyce", "victoria", "kelly", "christina", "lauren", "joan", "evelyn",
-    "olivia", "judith", "megan", "cheryl", "martha", "andrea", "frances", "hannah",
-    "jacqueline", "ann", "gloria", "jean", "kathryn", "alice", "teresa", "sara",
-    "janice", "doris", "madison", "julia", "grace", "denise", "amber", "marilyn",
-    "beverly", "danielle", "theresa", "sophia", "marie", "diana", "brittany",
-    "natalie", "isabella", "charlotte", "rose", "alexis", "kayla",
-}
-
-
-def classify_suspicious_specialty(value: Any) -> str | None:
-    """Return a short reason string when a stored specialty value looks wrong, else None."""
-    text = _normalize_candidate(value)
-    if not text:
-        return None
-
-    lowered = text.lower()
-    if lowered in _SPECIALTY_JUNK_VALUES:
-        return "junk_value"
-    if _SPECIALTY_EMAIL_RE.search(text):
-        return "email_address"
-    if _SPECIALTY_URL_RE.search(text):
-        return "url"
-    if _SPECIALTY_DOMAIN_RE.search(text):
-        return "domain_like_value"
-    if _SPECIALTY_PHONE_RE.search(text):
-        return "phone_number"
-
-    name_match = _SPECIALTY_NAME_PREFIX_RE.match(text)
-    if name_match and name_match.group(1).lower() in _COMMON_FIRST_NAMES:
-        return "name_prefix"
-
-    return None
+# Re-exported so existing imports of `processor.classify_suspicious_specialty` keep working;
+# the actual patterns live in specialty_rules so the SQL fetch and this check never drift apart.
+classify_suspicious_specialty = specialty_rules.classify_suspicious_specialty
 
 
 def _iter_specialty_fix_rows(max_rows: int | None = None) -> Iterator[Tuple[Dict[str, Any], str]]:
-    """Yield (row, reason) pairs for rows whose stored specialty looks suspicious."""
-    candidate_rows = fetch_profiles_with_candidate_specialty(limit=None)
+    """Page through DB-filtered candidate rows, re-checking each one in Python before yielding it.
+
+    `NEON_SPECIALTY_FIX_QUERY` already restricts the result set to suspicious
+    specialty values at the database level (see specialty_rules.build_specialty_fix_sql),
+    so this fetch is paginated with a keyset on `profile_id` instead of pulling
+    every row with a non-empty specialty into memory at once.
+    """
+    total_candidates = count_profiles_with_candidate_specialty()
+    logger.info(
+        "SPECIALTY_FIX_CANDIDATES_FOUND | count=%s | query=%s",
+        total_candidates,
+        CONFIG["neon_specialty_fix_query"].strip().splitlines()[0],
+    )
+    if not total_candidates:
+        return
+
+    batch_size = CONFIG["db_fetch_batch_size"]
+    last_profile_id = None
     yielded = 0
-    for row in candidate_rows:
-        reason = classify_suspicious_specialty(row.get("specialty"))
-        if not reason:
-            continue
-        yield row, reason
-        yielded += 1
-        if max_rows is not None and yielded >= max_rows:
+    fetched = 0
+
+    while True:
+        fetch_limit = (max_rows - yielded) if max_rows is not None else None
+        if fetch_limit is not None and fetch_limit <= 0:
+            return
+
+        rows = fetch_profiles_with_candidate_specialty_page(
+            batch_size=batch_size,
+            last_profile_id=last_profile_id,
+            limit=fetch_limit,
+        )
+        if not rows:
+            return
+
+        fetched += len(rows)
+        logger.info(
+            "SPECIALTY_FIX_BATCH_FETCHED | batch_rows=%s | fetched_so_far=%s | total_candidates=%s",
+            len(rows),
+            fetched,
+            total_candidates,
+        )
+
+        for row in rows:
+            reason = classify_suspicious_specialty(row.get("specialty"))
+            last_profile_id = _normalize_candidate(row.get("profile_id")) or last_profile_id
+            if not reason:
+                # The SQL filter already narrowed this down; a mismatch here just means
+                # the row's specialty changed between the count and the fetch.
+                continue
+            yield row, reason
+            yielded += 1
+            if max_rows is not None and yielded >= max_rows:
+                return
+
+        if len(rows) < batch_size:
             return
 
 
@@ -511,8 +504,24 @@ def run_specialty_fix(
                         skipped += 1
                     elif outcome == "failed":
                         failed += 1
+                    logger.info(
+                        "SPECIALTY_FIX_PROGRESS | dispatched=%s | updated=%s | skipped=%s | failed=%s",
+                        total_rows,
+                        processed,
+                        skipped,
+                        failed,
+                    )
     finally:
         state.flush()
+
+    logger.info(
+        "SPECIALTY_FIX_SUMMARY | dispatched=%s | updated=%s | skipped=%s | failed=%s | state_file=%s",
+        total_rows,
+        processed,
+        skipped,
+        failed,
+        state.state_path,
+    )
 
     return {
         "mode": "fix-specialty",

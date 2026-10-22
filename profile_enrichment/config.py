@@ -3,6 +3,8 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
+from profile_enrichment.specialty_rules import build_specialty_fix_sql
+
 ROOT_DIR = Path(__file__).resolve().parent.parent
 load_dotenv(ROOT_DIR / ".env", override=False)
 
@@ -25,9 +27,14 @@ CONFIG = {
         "NEON_REPROCESS_QUERY",
         f"SELECT * FROM {neon_table_name} WHERE specialty IS NULL",
     ),
+    # Filters at the database level for specialty values that look like a name
+    # prefix, phone number, email/domain, URL, or junk text - see
+    # profile_enrichment.specialty_rules for the exact patterns. This keeps the
+    # fix-specialty run from pulling every row with a non-empty specialty just
+    # to discard most of them in Python.
     "neon_specialty_fix_query": os.getenv(
         "NEON_SPECIALTY_FIX_QUERY",
-        f"SELECT * FROM {neon_table_name} WHERE specialty IS NOT NULL AND specialty !~ '^\\s*$'",
+        build_specialty_fix_sql(neon_table_name),
     ),
     "cloudflare_public_base_url": os.getenv("CLOUDFLARE_PUBLIC_BASE_URL"),
     "cloudflare_access_key": os.getenv("CLOUDFLARE_ACCESS_KEY"),

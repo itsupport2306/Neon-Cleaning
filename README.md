@@ -369,11 +369,33 @@ python -m profile_enrichment.processor --fix-specialty
 ```
 
 It uses the same `--workers`, `--no-ocr`, `--limit`, and `--verbose` flags as
-the normal run. Detection logic lives in
-`profile_enrichment.processor.classify_suspicious_specialty`; adjust
-`NEON_SPECIALTY_FIX_QUERY` in `.env` to narrow the initial candidate fetch.
-Rows it fixes are logged as `SPECIALTY_FIX_SUCCESS`; rows it could not resolve
-are logged as `SKIPPED_ROW | reason=could not resolve a verified specialty from the resume`.
+the normal run.
+
+### Why this is fast
+
+The filtering for name prefixes, phone numbers, emails/domains, URLs, and junk
+text (`web`, `n/a`, ...) runs **in the SQL query itself** (`NEON_SPECIALTY_FIX_QUERY`,
+built by `profile_enrichment.specialty_rules.build_specialty_fix_sql`), not in
+Python after fetching every row. Only rows the database already flagged as
+suspicious are paged in (keyset pagination on `profile_id`, `DB_FETCH_BATCH_SIZE`
+rows at a time) and only those get their resume downloaded, OCR'd, and sent to
+Qwen - rows with a valid specialty are never touched, never downloaded, and
+never reprocessed. `profile_enrichment.specialty_rules.classify_suspicious_specialty`
+is the single source of truth for the rule set: the SQL and the Python
+double-check are generated from the same patterns, so they can't drift apart.
+Override `NEON_SPECIALTY_FIX_QUERY` in `.env` only if you need a different rule set.
+
+### Logging
+
+The run logs to both the console and `logs/enrichment.log`:
+
+- `SPECIALTY_FIX_CANDIDATES_FOUND | count=...` - total suspicious rows before any processing starts.
+- `SPECIALTY_FIX_BATCH_FETCHED | batch_rows=... | fetched_so_far=... | total_candidates=...` - as each page is pulled from NeonDB.
+- `SPECIALTY_FIX_START | profile_id=... | bad_value=... | reason=...` - a row begins reprocessing.
+- `SPECIALTY_FIX_SUCCESS | profile_id=... | old_value=... | new_value=... | reason=...` - the column was corrected.
+- `SKIPPED_ROW | profile_id=... | reason=...` - could not resolve a verified specialty from the resume (or the document was unusable).
+- `SPECIALTY_FIX_PROGRESS | dispatched=... | updated=... | skipped=... | failed=...` - after every completed row.
+- `SPECIALTY_FIX_SUMMARY | dispatched=... | updated=... | skipped=... | failed=... | state_file=...` - once at the end of the run.
 
 ## Testing
 
