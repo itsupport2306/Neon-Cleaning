@@ -356,6 +356,25 @@ The script prints a summary result like:
 }
 ```
 
+## Fixing invalid `specialty` values
+
+Some rows already have a non-empty `specialty` that is actually a name prefix
+(`John, Cardiology`), a phone number, an email/domain (`yahoo.com`), a URL, or
+junk text like `web`. `--fix-specialty` finds only those rows, reprocesses
+their resume through the same extraction/validation pipeline, and writes a
+corrected value to `specialty` alone - every other column is left untouched.
+
+```bash
+python -m profile_enrichment.processor --fix-specialty
+```
+
+It uses the same `--workers`, `--no-ocr`, `--limit`, and `--verbose` flags as
+the normal run. Detection logic lives in
+`profile_enrichment.processor.classify_suspicious_specialty`; adjust
+`NEON_SPECIALTY_FIX_QUERY` in `.env` to narrow the initial candidate fetch.
+Rows it fixes are logged as `SPECIALTY_FIX_SUCCESS`; rows it could not resolve
+are logged as `SKIPPED_ROW | reason=could not resolve a verified specialty from the resume`.
+
 ## Testing
 
 The project includes a small pytest file to validate the sanitization logic and update safety rules.

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import os
+import re
 import threading
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from datetime import datetime, timedelta, timezone
@@ -23,8 +24,10 @@ from profile_enrichment.neon_db import (
     email_belongs_to_another_profile,
     fetch_profile_by_id,
     fetch_profiles_for_reprocessing_range,
+    fetch_profiles_with_candidate_specialty,
     fetch_reprocessing_created_at_bounds,
     update_profile_fields,
+    update_specialty_only,
 )
 from profile_enrichment.state_manager import StateManager
 
@@ -275,6 +278,251 @@ def _needed_target_fields(existing_row: Dict[str, Any] | None) -> Tuple[str, ...
     if not existing_row:
         return TARGET_FIELDS
     return tuple(field for field in TARGET_FIELDS if not _normalize_candidate(existing_row.get(field)))
+
+
+_SPECIALTY_JUNK_VALUES = {"web", "n/a", "na", "none", "unknown", "test", "-", "."}
+_SPECIALTY_EMAIL_RE = re.compile(r"[\w.+-]+@[\w-]+\.[a-z]{2,}", re.IGNORECASE)
+_SPECIALTY_DOMAIN_RE = re.compile(r"\b[\w-]+\.(com|net|org|io|co|gov|edu)\b", re.IGNORECASE)
+_SPECIALTY_URL_RE = re.compile(r"https?://|www\.", re.IGNORECASE)
+_SPECIALTY_PHONE_RE = re.compile(r"(?:\d[\s.\-()]*){7,}\d")
+_SPECIALTY_NAME_PREFIX_RE = re.compile(r"^\s*([A-Za-z]+)\s*[.,]\s*\S")
+# A small set of common first names used only to tell "John, Cardiology" (a name
+# prefix to strip) apart from a legitimate specialty that happens to contain a
+# comma or period, like "Pediatrics, General".
+_COMMON_FIRST_NAMES = {
+    "james", "john", "robert", "michael", "william", "david", "richard", "joseph",
+    "thomas", "charles", "christopher", "daniel", "matthew", "anthony", "mark",
+    "donald", "steven", "paul", "andrew", "joshua", "kenneth", "kevin", "brian",
+    "george", "timothy", "ronald", "edward", "jason", "jeffrey", "ryan", "jacob",
+    "gary", "nicholas", "eric", "jonathan", "stephen", "larry", "justin", "scott",
+    "brandon", "benjamin", "samuel", "frank", "raymond", "patrick", "alexander",
+    "jack", "dennis", "jerry", "mary", "patricia", "jennifer", "linda", "elizabeth",
+    "barbara", "susan", "jessica", "sarah", "karen", "nancy", "lisa", "margaret",
+    "betty", "sandra", "ashley", "kimberly", "emily", "donna", "michelle", "carol",
+    "amanda", "melissa", "deborah", "stephanie", "rebecca", "laura", "sharon",
+    "cynthia", "kathleen", "amy", "angela", "shirley", "anna", "ruth", "brenda",
+    "pamela", "nicole", "katherine", "samantha", "christine", "emma", "catherine",
+    "debra", "virginia", "rachel", "carolyn", "janet", "maria", "heather", "diane",
+    "julie", "joyce", "victoria", "kelly", "christina", "lauren", "joan", "evelyn",
+    "olivia", "judith", "megan", "cheryl", "martha", "andrea", "frances", "hannah",
+    "jacqueline", "ann", "gloria", "jean", "kathryn", "alice", "teresa", "sara",
+    "janice", "doris", "madison", "julia", "grace", "denise", "amber", "marilyn",
+    "beverly", "danielle", "theresa", "sophia", "marie", "diana", "brittany",
+    "natalie", "isabella", "charlotte", "rose", "alexis", "kayla",
+}
+
+
+def classify_suspicious_specialty(value: Any) -> str | None:
+    """Return a short reason string when a stored specialty value looks wrong, else None."""
+    text = _normalize_candidate(value)
+    if not text:
+        return None
+
+    lowered = text.lower()
+    if lowered in _SPECIALTY_JUNK_VALUES:
+        return "junk_value"
+    if _SPECIALTY_EMAIL_RE.search(text):
+        return "email_address"
+    if _SPECIALTY_URL_RE.search(text):
+        return "url"
+    if _SPECIALTY_DOMAIN_RE.search(text):
+        return "domain_like_value"
+    if _SPECIALTY_PHONE_RE.search(text):
+        return "phone_number"
+
+    name_match = _SPECIALTY_NAME_PREFIX_RE.match(text)
+    if name_match and name_match.group(1).lower() in _COMMON_FIRST_NAMES:
+        return "name_prefix"
+
+    return None
+
+
+def _iter_specialty_fix_rows(max_rows: int | None = None) -> Iterator[Tuple[Dict[str, Any], str]]:
+    """Yield (row, reason) pairs for rows whose stored specialty looks suspicious."""
+    candidate_rows = fetch_profiles_with_candidate_specialty(limit=None)
+    yielded = 0
+    for row in candidate_rows:
+        reason = classify_suspicious_specialty(row.get("specialty"))
+        if not reason:
+            continue
+        yield row, reason
+        yielded += 1
+        if max_rows is not None and yielded >= max_rows:
+            return
+
+
+def process_specialty_fix_record(
+    row: Dict[str, Any],
+    state: StateManager,
+    reason: str,
+    disable_ocr: bool = False,
+) -> str:
+    """Reprocess one resume to replace a known-bad `specialty` value, nothing else."""
+    profile_id = _normalize_candidate(row.get("profile_id"))
+    if not profile_id:
+        logger.warning("MISSING_PROFILE_ID | row=%s", row)
+        return "invalid"
+
+    bad_value = _normalize_candidate(row.get("specialty"))
+    logger.info(
+        "SPECIALTY_FIX_START | profile_id=%s | bad_value=%s | reason=%s",
+        profile_id,
+        bad_value,
+        reason,
+    )
+
+    file_ref = (
+        row.get("resume_url")
+        or row.get("resume_path")
+        or row.get("cloudflare_file")
+        or row.get("file_path")
+        or row.get("document_path")
+    )
+    if not file_ref:
+        _log_no_useful_information(profile_id, "missing file reference on source record")
+        state.mark_failed(profile_id)
+        return "failed"
+
+    try:
+        file_data = download_file_bytes(file_ref)
+    except Exception as exc:  # pragma: no cover - exercised in runtime only
+        logger.exception("CLOUDFLARE_DOWNLOAD_FAILURE | profile_id=%s | file_ref=%s | error=%s", profile_id, file_ref, exc)
+        state.mark_failed(profile_id)
+        return "failed"
+
+    if not file_data:
+        logger.error("CLOUDFLARE_DOWNLOAD_FAILURE | profile_id=%s | file_ref=%s | reason=no file downloaded", profile_id, file_ref)
+        state.mark_failed(profile_id)
+        return "failed"
+
+    file_ext = _extract_file_extension(file_ref)
+    try:
+        text_layers = extract_text_layers_from_bytes(file_data, file_ext, ocr_enabled=not disable_ocr)
+    except Exception as exc:  # pragma: no cover - exercised in runtime only
+        logger.exception("OCR_EXTRACTION_FAILURE | profile_id=%s | file_ref=%s | error=%s", profile_id, file_ref, exc)
+        state.mark_failed(profile_id)
+        return "failed"
+
+    combined_text = text_layers["combined_text"]
+    if not combined_text.strip():
+        _log_no_useful_information(profile_id, "document was downloaded but no text was extracted")
+        state.mark_skipped(profile_id)
+        return "skipped"
+
+    extracted = sanitize_extracted(
+        extract_profile_fields_from_text(combined_text),
+        source_text=combined_text,
+        profile_id=profile_id,
+        require_grounding=True,
+    )
+
+    try:
+        ai_extracted = run_ai_extraction(None, combined_text)
+    except Exception as exc:  # pragma: no cover - exercised in runtime only
+        logger.exception("AI_EXTRACTION_FAILURE | profile_id=%s | file_ref=%s | error=%s", profile_id, file_ref, exc)
+        ai_extracted = {}
+
+    ai_validated = sanitize_extracted(
+        ai_extracted,
+        source_text=combined_text,
+        profile_id=profile_id,
+        require_grounding=True,
+    )
+
+    final_extracted = combine_extracted_values(extracted, ai_validated)
+    new_specialty = _extracted_value_for("specialty", final_extracted)
+
+    if not new_specialty or new_specialty.lower() == bad_value.lower():
+        _log_no_useful_information(profile_id, "could not resolve a verified specialty from the resume")
+        state.mark_skipped(profile_id)
+        return "skipped"
+
+    try:
+        update_specialty_only(profile_id, new_specialty)
+    except Exception as exc:  # pragma: no cover - exercised in runtime only
+        logger.exception("NEONDB_UPDATE_FAILURE | profile_id=%s | updates=%s | error=%s", profile_id, {"specialty": new_specialty}, exc)
+        state.mark_failed(profile_id)
+        return "failed"
+
+    logger.info(
+        "SPECIALTY_FIX_SUCCESS | profile_id=%s | old_value=%s | new_value=%s | reason=%s",
+        profile_id,
+        bad_value,
+        new_specialty,
+        reason,
+    )
+    state.mark_processed(profile_id)
+    return "processed"
+
+
+def run_specialty_fix(
+    max_rows: int | None = None,
+    disable_ocr: bool = False,
+    worker_count: int | None = None,
+) -> Dict[str, Any]:
+    worker_count = max(1, worker_count or CONFIG["worker_count"])
+    state = StateManager(CONFIG["state_file"])
+    state.set_last_run(datetime.now(timezone.utc).isoformat())
+
+    global _no_useful_information_count
+    _no_useful_information_count = 0
+
+    total_rows = 0
+    processed = 0
+    skipped = 0
+    failed = 0
+
+    row_iter = _iter_specialty_fix_rows(max_rows=max_rows)
+    active_futures: Dict[Any, str] = {}
+
+    try:
+        with ThreadPoolExecutor(max_workers=worker_count) as executor:
+            while True:
+                while len(active_futures) < worker_count:
+                    try:
+                        row, reason = next(row_iter)
+                    except StopIteration:
+                        break
+
+                    profile_id = _normalize_candidate(row.get("profile_id"))
+                    if not profile_id:
+                        continue
+
+                    total_rows += 1
+                    future = executor.submit(
+                        process_specialty_fix_record,
+                        row,
+                        state,
+                        reason,
+                        disable_ocr,
+                    )
+                    active_futures[future] = profile_id
+
+                if not active_futures:
+                    break
+
+                done, _ = wait(tuple(active_futures), return_when=FIRST_COMPLETED)
+                for future in done:
+                    active_futures.pop(future, None)
+                    outcome = future.result()
+                    if outcome == "processed":
+                        processed += 1
+                    elif outcome == "skipped":
+                        skipped += 1
+                    elif outcome == "failed":
+                        failed += 1
+    finally:
+        state.flush()
+
+    return {
+        "mode": "fix-specialty",
+        "total_rows": total_rows,
+        "processed": processed,
+        "skipped": skipped,
+        "failed": failed,
+        "no_text_extracted": _no_useful_information_count,
+        "state_file": str(state.state_path),
+    }
 
 
 def _iter_neon_rows(max_rows: int | None = None) -> Iterator[Dict[str, Any]]:
@@ -632,6 +880,14 @@ if __name__ == "__main__":
         help="Only fill blank NeonDB columns; never change a column that already has a value.",
     )
     parser.add_argument("--verbose", action="store_true", help="Show per-profile diagnostic lines that are normally file-only.")
+    parser.add_argument(
+        "--fix-specialty",
+        action="store_true",
+        help=(
+            "Only reprocess rows whose stored specialty looks invalid (a name prefix, phone "
+            "number, email/domain, URL, or junk text like 'web') and update just that column."
+        ),
+    )
     args = parser.parse_args()
 
     if args.verbose:
@@ -652,6 +908,15 @@ if __name__ == "__main__":
 
     if args.no_overwrite:
         CONFIG["allow_overwrite_existing"] = False
+
+    if args.fix_specialty:
+        result = run_specialty_fix(
+            max_rows=(None if args.limit in (0, None) else args.limit),
+            disable_ocr=args.no_ocr,
+            worker_count=args.workers,
+        )
+        print(result)
+        raise SystemExit(0)
 
     result = run_enrichment(
         csv_path=args.csv_path,

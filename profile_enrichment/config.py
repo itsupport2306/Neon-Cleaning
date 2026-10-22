@@ -25,6 +25,10 @@ CONFIG = {
         "NEON_REPROCESS_QUERY",
         f"SELECT * FROM {neon_table_name} WHERE specialty IS NULL",
     ),
+    "neon_specialty_fix_query": os.getenv(
+        "NEON_SPECIALTY_FIX_QUERY",
+        f"SELECT * FROM {neon_table_name} WHERE specialty IS NOT NULL AND specialty !~ '^\\s*$'",
+    ),
     "cloudflare_public_base_url": os.getenv("CLOUDFLARE_PUBLIC_BASE_URL"),
     "cloudflare_access_key": os.getenv("CLOUDFLARE_ACCESS_KEY"),
     "cloudflare_secret_key": os.getenv("CLOUDFLARE_SECRET_KEY"),

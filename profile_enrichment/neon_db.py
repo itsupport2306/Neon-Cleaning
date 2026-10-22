@@ -89,6 +89,33 @@ def fetch_profiles_for_reprocessing_range(
             return [dict(zip(columns, row)) for row in rows]
 
 
+def fetch_profiles_with_candidate_specialty(limit: int | None = None) -> List[Dict[str, Any]]:
+    """Broad fetch of rows with a non-empty specialty; callers filter for suspicious values themselves."""
+    sql = CONFIG["neon_specialty_fix_query"].strip().rstrip(";")
+    if limit is not None:
+        sql = f"{sql} LIMIT %s"
+        params: tuple[Any, ...] = (limit,)
+    else:
+        params = ()
+
+    with get_connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(sql, params)
+            rows = cursor.fetchall()
+            columns = [desc[0] for desc in cursor.description]
+            return [dict(zip(columns, row)) for row in rows]
+
+
+def update_specialty_only(profile_id: str, specialty: str) -> None:
+    """Write a corrected specialty value without touching any other column."""
+    table_name = CONFIG["neon_table_name"]
+    sql = f'UPDATE {table_name} SET "specialty" = %s WHERE profile_id = %s;'
+    with get_connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(sql, (specialty, profile_id))
+        conn.commit()
+
+
 def fetch_profile_by_id(profile_id: str) -> Optional[Dict[str, Any]]:
     table_name = CONFIG["neon_table_name"]
     sql = f"SELECT * FROM {table_name} WHERE profile_id = %s LIMIT 1;"
