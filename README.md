@@ -359,10 +359,15 @@ The script prints a summary result like:
 ## Fixing invalid `specialty` values
 
 Some rows already have a non-empty `specialty` that is actually a name prefix
-(`John, Cardiology`), a phone number, an email/domain (`yahoo.com`), a URL, or
-junk text like `web`. `--fix-specialty` finds only those rows, reprocesses
-their resume through the same extraction/validation pipeline, and writes a
-corrected value to `specialty` alone - every other column is left untouched.
+(`John, Cardiology`), a phone number, an email/domain (`yahoo.com`), a URL,
+junk text like `web`, or a value known by manual review to be invalid/
+misspelled/non-standard (any exact match, case/whitespace insensitive,
+against `unmatched_specialities_for_review.csv` at the repo root - used
+strictly as a read-only reference for *which* stored values are wrong, never
+as a source of the corrected value or edited in place). `--fix-specialty`
+finds only those rows, reprocesses their resume through the same extraction/
+validation pipeline, and writes a corrected value to `specialty` alone -
+every other column is left untouched.
 
 ```bash
 python -m profile_enrichment.processor --fix-specialty
@@ -396,6 +401,27 @@ The run logs to both the console and `logs/enrichment.log`:
 - `SKIPPED_ROW | profile_id=... | reason=...` - could not resolve a verified specialty from the resume (or the document was unusable).
 - `SPECIALTY_FIX_PROGRESS | dispatched=... | updated=... | skipped=... | failed=...` - after every completed row.
 - `SPECIALTY_FIX_SUMMARY | dispatched=... | updated=... | skipped=... | failed=... | state_file=...` - once at the end of the run.
+
+## Duplicate profile cleanup (`profile_dedup`)
+
+A separate module, `profile_dedup`, finds and safely merges duplicate rows in
+the same `profiles` table (matched by phone+name, or NPI/email) - this is
+unrelated to resume extraction and does not touch `specialty`. It is
+read-only by default and only writes with `--apply`, and even then prefers a
+soft-merge (`merged_into`/`merged_at`) over deleting a row that has any
+activity history.
+
+```bash
+# Dry run (default) - writes a report under profile_dedup/reports/, nothing in the DB.
+python -m profile_dedup.run_dedup
+
+# Apply CERTAIN/HIGH-confidence merges (prompts for a typed "APPLY" confirmation).
+python -m profile_dedup.run_dedup --apply
+```
+
+See `profile_dedup/README.md` for the full match-confidence rules, merge
+strategy per column, what happens to a merged duplicate row, and all config
+options - this section is just a pointer to it.
 
 ## Testing
 

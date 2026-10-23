@@ -9,3 +9,5 @@ __pycache__/
 *.egg-info/
 .venv/
 venv/
+profile_dedup/reports/*.json
+profile_dedup/reports/*.csv

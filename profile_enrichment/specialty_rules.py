@@ -7,10 +7,49 @@ patterns and name list, so the two can never drift out of sync.
 
 from __future__ import annotations
 
+import csv
 import re
+from functools import lru_cache
+from pathlib import Path
 from typing import Any, Optional
 
 JUNK_VALUES: tuple[str, ...] = ("web", "n/a", "na", "none", "unknown", "test", "-", ".")
+
+# Reference list of specialty strings already confirmed, by manual review, to be
+# invalid/misspelled/non-standard (`unmatched_specialities_for_review.csv`, kept at the
+# repo root and never modified by this code - it is read-only reference data). Any
+# stored `specialty` value that exactly matches one of these (case/whitespace
+# insensitive) is corrected the same way as the other suspicious patterns below: by
+# reprocessing the resume, never by guessing a replacement from the CSV itself.
+DEFAULT_REFERENCE_CSV_PATH = Path(__file__).resolve().parent.parent / "unmatched_specialities_for_review.csv"
+_REFERENCE_CSV_COLUMN_CANDIDATES = ("speciality", "specialty")
+
+
+@lru_cache(maxsize=4)
+def _load_reference_unmatched_values(path: str) -> frozenset[str]:
+    csv_path = Path(path)
+    if not csv_path.exists():
+        return frozenset()
+
+    values: set[str] = set()
+    with csv_path.open(newline="", encoding="utf-8-sig") as fh:
+        reader = csv.DictReader(fh)
+        column = next(
+            (c for c in _REFERENCE_CSV_COLUMN_CANDIDATES if reader.fieldnames and c in reader.fieldnames),
+            None,
+        )
+        if column is None:
+            return frozenset()
+        for row in reader:
+            cleaned = " ".join(str(row.get(column) or "").split()).lower()
+            if cleaned:
+                values.add(cleaned)
+    return frozenset(values)
+
+
+def get_reference_unmatched_values(path: Optional[Path | str] = None) -> frozenset[str]:
+    """Known-bad specialty strings from the review CSV, lowercased/whitespace-normalized."""
+    return _load_reference_unmatched_values(str(path or DEFAULT_REFERENCE_CSV_PATH))
 
 # A small set of common first names used only to tell "John, Cardiology" (a name
 # prefix to strip) apart from a legitimate specialty that happens to contain a
@@ -66,10 +105,15 @@ def classify_suspicious_specialty(value: Any) -> Optional[str]:
     if name_match and name_match.group(1).lower() in COMMON_FIRST_NAMES:
         return "name_prefix"
 
+    if lowered in get_reference_unmatched_values():
+        return "unmatched_reference_csv"
+
     return None
 
 
 def _sql_string_array(values: tuple[str, ...]) -> str:
+    if not values:
+        return "ARRAY[]::text[]"
     escaped = ", ".join("'" + value.replace("'", "''") + "'" for value in values)
     return f"ARRAY[{escaped}]"
 
@@ -89,6 +133,7 @@ def build_specialty_fix_sql(table_name: str) -> str:
     """
     junk_array = _sql_string_array(JUNK_VALUES)
     names_array = _sql_string_array(COMMON_FIRST_NAMES)
+    reference_array = _sql_string_array(tuple(sorted(get_reference_unmatched_values())))
     return (
         f"SELECT * FROM {table_name}\n"
         "WHERE specialty IS NOT NULL\n"
@@ -100,5 +145,6 @@ def build_specialty_fix_sql(table_name: str) -> str:
         "    OR specialty ~* '\\b[a-z0-9-]+\\.(com|net|org|io|co|gov|edu)\\b'\n"
         "    OR specialty ~ '(?:\\d[\\s.\\-()]*){7,}\\d'\n"
         f"    OR lower(substring(specialty from '^\\s*([A-Za-z]+)\\s*[.,]\\s*\\S')) = ANY ({names_array})\n"
+        f"    OR lower(btrim(specialty)) = ANY ({reference_array})\n"
         "  )"
     )
