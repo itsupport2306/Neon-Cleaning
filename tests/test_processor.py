@@ -73,6 +73,48 @@ def test_build_update_map_only_fills_phone_when_null():
     assert "phone" not in build_update_map(existing, extracted)
 
 
+def test_process_specialty_fix_record_repairs_credential_prefix_without_downloading(monkeypatch, tmp_path: Path):
+    row = {"profile_id": "p1", "specialty": "00, General _ General Surgery", "resume_url": "irrelevant.pdf"}
+    state = StateManager(str(tmp_path / "state.json"))
+
+    monkeypatch.setattr(processor, "download_file_bytes", lambda _: (_ for _ in ()).throw(AssertionError("should not download")))
+
+    captured = {}
+    monkeypatch.setattr(processor, "update_specialty_only", lambda profile_id, specialty: captured.update(profile_id=profile_id, specialty=specialty))
+
+    outcome = processor.process_specialty_fix_record(row, state, "leading_digit_junk")
+
+    assert outcome == "processed"
+    assert captured == {"profile_id": "p1", "specialty": "General Surgery"}
+
+
+def test_process_specialty_fix_record_falls_back_to_resume_for_unrepairable_junk(monkeypatch, tmp_path: Path):
+    row = {
+        "profile_id": "p2",
+        "specialty": "19780 Castleberry Loop Oregon City, OR",
+        "resume_url": "irrelevant.pdf",
+    }
+    state = StateManager(str(tmp_path / "state.json"))
+
+    monkeypatch.setattr(processor, "download_file_bytes", lambda _: b"%PDF-1.4")
+    monkeypatch.setattr(
+        processor,
+        "extract_text_layers_from_bytes",
+        lambda *_, **__: {"combined_text": "some resume text"},
+    )
+    monkeypatch.setattr(processor, "extract_profile_fields_from_text", lambda _: {"specialty": "Family Medicine"})
+    monkeypatch.setattr(processor, "run_ai_extraction", lambda *_: {})
+    monkeypatch.setattr(processor, "sanitize_extracted", lambda extracted, **kwargs: extracted)
+
+    captured = {}
+    monkeypatch.setattr(processor, "update_specialty_only", lambda profile_id, specialty: captured.update(profile_id=profile_id, specialty=specialty))
+
+    outcome = processor.process_specialty_fix_record(row, state, "leading_digit_junk")
+
+    assert outcome == "processed"
+    assert captured == {"profile_id": "p2", "specialty": "Family Medicine"}
+
+
 def test_comprehensive_merge_does_not_overwrite_non_null_phone(monkeypatch):
     monkeypatch.setitem(processor.CONFIG, "allow_overwrite_existing", True)
     existing = {"phone": "5550000000"}

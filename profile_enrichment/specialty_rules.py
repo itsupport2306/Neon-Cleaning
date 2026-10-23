@@ -87,6 +87,50 @@ _NAME_PREFIX_RE = re.compile(r"^\s*([A-Za-z]+)\s*[.,]\s*\S")
 # was scraped into the specialty field by mistake ("19780 Castleberry Loop...").
 _LEADING_DIGIT_RE = re.compile(r"^\s*\d")
 
+# Matches a short (1-3 char) leading token that contains at least one digit -
+# the garbled "MD"/"DO" credential marker - followed by a comma/period and
+# whitespace, then the real specialty text (which starts with a capital letter).
+# Deliberately narrower than _LEADING_DIGIT_RE: it must not match the street-address
+# case, where the leading digit run is longer than 3 characters and isn't followed
+# by a separator until well past the token (see repair_leading_digit_specialty).
+_CREDENTIAL_PREFIX_RE = re.compile(
+    r"^\s*(?=[0-9A-Za-z]{1,3}[.,]?\s)(?=[^,\s]*\d)[0-9A-Za-z]{1,3}[.,]?\s+(?=[A-Z])"
+)
+_UNDERSCORE_RE = re.compile(r"(?:^|\s)_+(?:\s|$)")
+_VALID_SPECIALTY_RE = re.compile(r"[A-Za-z][A-Za-z\s,/&'-]*")
+
+
+def repair_leading_digit_specialty(value: Any) -> Optional[str]:
+    """Try to recover the real specialty from a garbled OCR credential prefix.
+
+    Handles values like "00, General _ General Surgery" or "1D Pulmonology"
+    (where "MD"/"DO" was OCR'd as digits) by stripping the bogus prefix,
+    collapsing stray underscores, and removing immediate duplicate words left
+    behind by the OCR pass. Returns None when the value doesn't match this
+    specific pattern (e.g. a street address scraped into the specialty field),
+    so the caller knows to fall back to full resume reprocessing instead.
+    """
+    text = "" if value is None else " ".join(str(value).split())
+    match = _CREDENTIAL_PREFIX_RE.match(text)
+    if not match:
+        return None
+
+    remainder = text[match.end():]
+    remainder = _UNDERSCORE_RE.sub(" ", remainder)
+    words = remainder.split()
+    deduped: list[str] = []
+    for word in words:
+        if deduped and deduped[-1].lower() == word.lower():
+            continue
+        deduped.append(word)
+    remainder = " ".join(deduped).strip(" ,.")
+
+    if not remainder or any(ch.isdigit() for ch in remainder):
+        return None
+    if not _VALID_SPECIALTY_RE.fullmatch(remainder):
+        return None
+    return remainder
+
 
 def classify_suspicious_specialty(value: Any) -> Optional[str]:
     """Return a short reason string when a stored specialty value looks wrong, else None."""

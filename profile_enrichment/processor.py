@@ -364,6 +364,34 @@ def process_specialty_fix_record(
         reason,
     )
 
+    if reason == "leading_digit_junk":
+        repaired = specialty_rules.repair_leading_digit_specialty(bad_value)
+        if repaired and repaired.lower() != bad_value.lower():
+            try:
+                update_specialty_only(profile_id, repaired)
+            except Exception as exc:  # pragma: no cover - exercised in runtime only
+                logger.exception(
+                    "NEONDB_UPDATE_FAILURE | profile_id=%s | updates=%s | error=%s",
+                    profile_id,
+                    {"specialty": repaired},
+                    exc,
+                )
+                state.mark_failed(profile_id)
+                return "failed"
+
+            logger.info(
+                "SPECIALTY_FIX_SUCCESS | profile_id=%s | old_value=%s | new_value=%s | reason=%s_text_repair",
+                profile_id,
+                bad_value,
+                repaired,
+                reason,
+            )
+            state.mark_processed(profile_id)
+            return "processed"
+        # Couldn't recover a clean specialty from the text alone (e.g. the field holds
+        # an address, not a garbled credential prefix) - fall through to a full
+        # resume reprocess below, the same as every other suspicious-value reason.
+
     file_ref = (
         row.get("resume_url")
         or row.get("resume_path")
