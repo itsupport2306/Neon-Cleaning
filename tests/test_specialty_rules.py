@@ -9,6 +9,15 @@ def test_classify_valid_specialty_is_not_suspicious():
     assert sr.classify_suspicious_specialty("Cardiology") is None
 
 
+def test_classify_leading_digit_junk():
+    # OCR-garbled credential prefixes ("MD"/"DO" misread as digits).
+    assert sr.classify_suspicious_specialty("00, General _ General Surgery") == "leading_digit_junk"
+    assert sr.classify_suspicious_specialty("0O, General General Surgery") == "leading_digit_junk"
+    assert sr.classify_suspicious_specialty("1D Pulmonology") == "leading_digit_junk"
+    # A street address scraped into the specialty field by mistake.
+    assert sr.classify_suspicious_specialty("19780 Castleberry Loop Oregon City, OR") == "leading_digit_junk"
+
+
 def test_classify_matches_reference_csv(tmp_path):
     csv_path = tmp_path / "unmatched.csv"
     csv_path.write_text("speciality,row_count\nSome Bad Value,12\n", encoding="utf-8")

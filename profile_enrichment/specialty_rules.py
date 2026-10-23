@@ -81,6 +81,11 @@ _DOMAIN_RE = re.compile(r"\b[\w-]+\.(com|net|org|io|co|gov|edu)\b", re.IGNORECAS
 _URL_RE = re.compile(r"https?://|www\.", re.IGNORECASE)
 _PHONE_RE = re.compile(r"(?:\d[\s.\-()]*){7,}\d")
 _NAME_PREFIX_RE = re.compile(r"^\s*([A-Za-z]+)\s*[.,]\s*\S")
+# No real specialty starts with a digit, so this catches two distinct OCR failure
+# modes seen in practice: a misread credential prefix ("00, General Surgery" /
+# "1D Pulmonology", where "MD"/"DO" got OCR'd as digits) and a street address that
+# was scraped into the specialty field by mistake ("19780 Castleberry Loop...").
+_LEADING_DIGIT_RE = re.compile(r"^\s*\d")
 
 
 def classify_suspicious_specialty(value: Any) -> Optional[str]:
@@ -100,6 +105,8 @@ def classify_suspicious_specialty(value: Any) -> Optional[str]:
         return "domain_like_value"
     if _PHONE_RE.search(text):
         return "phone_number"
+    if _LEADING_DIGIT_RE.match(text):
+        return "leading_digit_junk"
 
     name_match = _NAME_PREFIX_RE.match(text)
     if name_match and name_match.group(1).lower() in COMMON_FIRST_NAMES:
@@ -144,6 +151,7 @@ def build_specialty_fix_sql(table_name: str) -> str:
         "    OR specialty ~* 'https?://|www\\.'\n"
         "    OR specialty ~* '\\b[a-z0-9-]+\\.(com|net|org|io|co|gov|edu)\\b'\n"
         "    OR specialty ~ '(?:\\d[\\s.\\-()]*){7,}\\d'\n"
+        "    OR specialty ~ '^\\s*\\d'\n"
         f"    OR lower(substring(specialty from '^\\s*([A-Za-z]+)\\s*[.,]\\s*\\S')) = ANY ({names_array})\n"
         f"    OR lower(btrim(specialty)) = ANY ({reference_array})\n"
         "  )"
