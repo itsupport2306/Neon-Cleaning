@@ -76,6 +76,35 @@ COMMON_FIRST_NAMES: tuple[str, ...] = (
     "natalie", "isabella", "charlotte", "rose", "alexis", "kayla",
 )
 
+# US state names/codes stored as the specialty by mistake (e.g. a state field
+# scraped into the wrong column). Matched only when the *entire* value is a
+# state, so a legitimate specialty that happens to contain "Washington" (as in
+# "Washington University") is never flagged.
+US_STATE_NAMES: tuple[str, ...] = (
+    "alabama", "alaska", "arizona", "arkansas", "california", "colorado",
+    "connecticut", "delaware", "district of columbia", "florida", "georgia",
+    "hawaii", "idaho", "illinois", "indiana", "iowa", "kansas", "kentucky",
+    "louisiana", "maine", "maryland", "massachusetts", "michigan", "minnesota",
+    "mississippi", "missouri", "montana", "nebraska", "nevada",
+    "new hampshire", "new jersey", "new mexico", "new york", "north carolina",
+    "north dakota", "ohio", "oklahoma", "oregon", "pennsylvania",
+    "rhode island", "south carolina", "south dakota", "tennessee", "texas",
+    "utah", "vermont", "virginia", "washington", "west virginia", "wisconsin",
+    "wyoming",
+)
+US_STATE_CODES: tuple[str, ...] = (
+    "al", "ak", "az", "ar", "ca", "co", "ct", "de", "dc", "fl", "ga", "hi",
+    "id", "il", "in", "ia", "ks", "ky", "la", "me", "md", "ma", "mi", "mn",
+    "ms", "mo", "mt", "ne", "nv", "nh", "nj", "nm", "ny", "nc", "nd", "oh",
+    "ok", "or", "pa", "ri", "sc", "sd", "tn", "tx", "ut", "vt", "va", "wa",
+    "wv", "wi", "wy",
+)
+_STATE_CODE_RE = re.compile(r"^[A-Za-z]{2}$")
+# A full "First Last" name with no comma/period separator, where the first
+# word is a known first name - distinct from the "John, Cardiology" prefix
+# case handled by _NAME_PREFIX_RE, which requires a separator.
+_FULL_NAME_RE = re.compile(r"^\s*([A-Za-z]+)\s+[A-Za-z]+(?:\s+[A-Za-z]+)?\s*$")
+
 _EMAIL_RE = re.compile(r"[\w.+-]+@[\w-]+\.[a-z]{2,}", re.IGNORECASE)
 _DOMAIN_RE = re.compile(r"\b[\w-]+\.(com|net|org|io|co|gov|edu)\b", re.IGNORECASE)
 _URL_RE = re.compile(r"https?://|www\.", re.IGNORECASE)
@@ -156,6 +185,13 @@ def classify_suspicious_specialty(value: Any) -> Optional[str]:
     if name_match and name_match.group(1).lower() in COMMON_FIRST_NAMES:
         return "name_prefix"
 
+    if lowered in US_STATE_NAMES or (_STATE_CODE_RE.match(text) and lowered in US_STATE_CODES):
+        return "state_value"
+
+    full_name_match = _FULL_NAME_RE.match(text)
+    if full_name_match and full_name_match.group(1).lower() in COMMON_FIRST_NAMES:
+        return "name_full"
+
     if lowered in get_reference_unmatched_values():
         return "unmatched_reference_csv"
 
@@ -184,6 +220,8 @@ def build_specialty_fix_sql(table_name: str) -> str:
     """
     junk_array = _sql_string_array(JUNK_VALUES)
     names_array = _sql_string_array(COMMON_FIRST_NAMES)
+    states_array = _sql_string_array(US_STATE_NAMES)
+    state_codes_array = _sql_string_array(US_STATE_CODES)
     reference_array = _sql_string_array(tuple(sorted(get_reference_unmatched_values())))
     return (
         f"SELECT * FROM {table_name}\n"
@@ -197,6 +235,9 @@ def build_specialty_fix_sql(table_name: str) -> str:
         "    OR specialty ~ '(?:\\d[\\s.\\-()]*){7,}\\d'\n"
         "    OR specialty ~ '^\\s*\\d'\n"
         f"    OR lower(substring(specialty from '^\\s*([A-Za-z]+)\\s*[.,]\\s*\\S')) = ANY ({names_array})\n"
+        f"    OR lower(btrim(specialty)) = ANY ({states_array})\n"
+        f"    OR (btrim(specialty) ~ '^[A-Za-z]{{2}}$' AND lower(btrim(specialty)) = ANY ({state_codes_array}))\n"
+        f"    OR lower(substring(btrim(specialty) from '^([A-Za-z]+)\\s+[A-Za-z]+(?:\\s+[A-Za-z]+)?$')) = ANY ({names_array})\n"
         f"    OR lower(btrim(specialty)) = ANY ({reference_array})\n"
         "  )"
     )

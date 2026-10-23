@@ -18,6 +18,21 @@ def test_classify_leading_digit_junk():
     assert sr.classify_suspicious_specialty("19780 Castleberry Loop Oregon City, OR") == "leading_digit_junk"
 
 
+def test_classify_state_name_and_code():
+    assert sr.classify_suspicious_specialty("Texas") == "state_value"
+    assert sr.classify_suspicious_specialty("  california ") == "state_value"
+    assert sr.classify_suspicious_specialty("NY") == "state_value"
+    # Not flagged: a real specialty that happens to contain a state-like word.
+    assert sr.classify_suspicious_specialty("Washington University Fellow") is None
+
+
+def test_classify_full_name_without_separator():
+    assert sr.classify_suspicious_specialty("John Smith") == "name_full"
+    assert sr.classify_suspicious_specialty("Mary Jane Watson") == "name_full"
+    assert sr.classify_suspicious_specialty("Cardiology") is None
+    assert sr.classify_suspicious_specialty("Family Medicine") is None
+
+
 def test_classify_matches_reference_csv(tmp_path):
     csv_path = tmp_path / "unmatched.csv"
     csv_path.write_text("speciality,row_count\nSome Bad Value,12\n", encoding="utf-8")
