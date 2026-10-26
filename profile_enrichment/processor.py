@@ -12,6 +12,7 @@ from profile_enrichment.config import CONFIG
 from profile_enrichment.downloaders import download_file_bytes
 from profile_enrichment.extractors import (
     combine_extracted_values,
+    consume_ai_call_failure,
     extract_profile_fields_from_text,
     extract_text_layers_from_bytes,
     run_ai_extraction,
@@ -701,6 +702,11 @@ def process_profile_record(
             should_run_ai = bool(missing_before_ai)
             ai_extracted = run_ai_extraction(None, combined_text) if should_run_ai else {}
             ai_processed = bool(should_run_ai)
+        ai_error = consume_ai_call_failure()
+        if ai_error:
+            # A failed or malformed model response is not "AI processing": never label it as such.
+            logger.warning("AI_EXTRACTION_FAILED | profile_id=%s | error=%s", profile_id, ai_error)
+            ai_processed = False
     except Exception as exc:  # pragma: no cover - exercised in runtime only
         logger.exception("AI_EXTRACTION_FAILURE | profile_id=%s | file_ref=%s | error=%s", profile_id, file_ref, exc)
         ai_extracted = {}

@@ -1,0 +1,10 @@
+profile_id,outcome,reason,attempts,qwen_status,fields_written
+03c4c865-8873-4d6b-ac21-5101cab699c8,validation_failed,"rejected: [('Oracle Database Administration', 'value_not_in_source')]",1,ok,
+561449e3-58af-46ba-a50e-5f3e520178be,insufficient_evidence,specialty_not_in_taxonomy: ['Dietary Aide'],1,insufficient_evidence,
+58c51b0a-39c4-4807-91a6-2b036f0aafe1,insufficient_evidence,no_healthcare_context,1,ok,
+5a486ae9-96d2-4f86-9092-ad36bdee2377,insufficient_evidence,"specialty_not_in_taxonomy: ['Logistics, Transportation, and Warehouse Operations']",1,insufficient_evidence,
+5a8f4974-1a48-4324-8c7f-b87a76065f41,insufficient_evidence,specialty_not_in_taxonomy: ['Data Security Cloud Services Voice and MPLS'],1,insufficient_evidence,
+5c05ced0-81e9-4178-b6a0-e0411305bd1e,insufficient_evidence,specialty_not_in_taxonomy: ['Warehousing Support'],1,insufficient_evidence,
+64b16524-a5e4-40d8-927e-c7660ed4933c,insufficient_evidence,"competing_specialties [('Registered Nurse', 10.0), ('RN Case Manager', 4.5), ('PACU', 4.0)]",1,ok,
+6e1257db-4051-4e07-98d0-e0be6727e129,insufficient_evidence,specialty_not_in_taxonomy: ['Placenta encapsulation'],1,insufficient_evidence,
+b59f552d-8327-43be-b78d-a26c29422a98,insufficient_evidence,specialty_not_in_taxonomy: ['city'],1,insufficient_evidence,

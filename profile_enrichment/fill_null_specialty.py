@@ -1,23 +1,24 @@
-"""Fill in every profile whose `specialty` is NULL, with no date window and no row limit.
+"""Fill `profiles.specialty` (and other blank, evidence-backed fields) for every row where specialty IS NULL.
 
-Run:
-    python -m profile_enrichment.fill_null_specialty
+    SELECT * FROM public.profiles WHERE specialty IS NULL;      -- no date window, no hidden filter
 
-The full list of matching `profile_id`s is read once up front and becomes the
-manifest for the run. Each ID ends in exactly one terminal status:
+Safe by default: ``run`` only *prepares* proposals (download -> text/OCR -> Qwen -> validation) and writes
+nothing; add ``--apply`` to write. Every selected profile_id is stored in a durable manifest (SQLite) and ends
+in exactly one outcome:
 
-* ``resolved``   - specialty is no longer NULL (other verified columns may have changed too)
-* ``unresolved`` - the resume was processed but no verified specialty could be found; reason logged
-* ``failed``     - download / OCR / database error; reason logged
+    verified_updated      specialty written and confirmed by an independent read-back
+    no_resume             no resume reference, or the file no longer exists (HTTP 404/410)
+    download_failed       network / server error fetching the resume            (retryable)
+    extraction_failed     unreadable document, or OCR could not be completed    (retryable)
+    inference_failed      Qwen unavailable / timeout / malformed / truncated     (retryable)
+    validation_failed     a specialty candidate existed but failed validation
+    insufficient_evidence the resume does not establish a specialty (or only a non-taxonomy phrase)
+    concurrent_change     the row changed after it was read; nothing was overwritten (retryable)
+    update_failed         database error or read-back mismatch                   (retryable)
+    pending               not attempted yet (or prepared and waiting for --apply)
 
-``resolved + unresolved + failed`` always equals the number of IDs identified, and the
-run exits non-zero if they do not. Per-ID status is saved to a run-state file, so an
-interrupted run resumes without redoing finished IDs.
-
-Each profile goes through the same Qwen pipeline as ``processor --reprocess-all``
-(download resume -> native text/OCR -> Qwen -> validation -> compare with the stored
-row): a stored value the resume confirms is never overwritten, and a value that is
-not in the resume is never written.
+Commands (python -m profile_enrichment.fill_null_specialty <command>): run (default), resume, apply, status,
+preflight, export-review, apply-review, export-unresolved, rollback, refresh-vocabulary.
 """
 from __future__ import annotations
 
@@ -25,282 +26,703 @@ import argparse
 import csv
 import json
 import logging
-import re
+import os
+import queue
+import signal
+import sys
 import threading
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import time
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional, Sequence
 
-from profile_enrichment import processor
-from profile_enrichment.config import CONFIG
-from profile_enrichment.extractors import consume_ai_call_failure, run_ai_extraction
-from profile_enrichment.neon_db import PROFILE_COLUMNS, fetch_profile_by_id, get_connection
-from profile_enrichment.state_manager import StateManager
+from profile_enrichment import inference, job_store as js
+from profile_enrichment.config import CONFIG, PROMPT_VERSION
+from profile_enrichment.logging_utils import setup_logger
+from profile_enrichment.pipeline import Pipeline, Work
 
-logger = processor.logger
+logger = setup_logger()
 
-RESOLVED = "resolved"
-UNRESOLVED = "unresolved"
-FAILED = "failed"
-TERMINAL_STATUSES = (RESOLVED, UNRESOLVED, FAILED)
-
-_PROFILE_ID_IN_MESSAGE = re.compile(r"profile_id=(\S+)")
+EXIT_OK, EXIT_FAILURES, EXIT_INCOMPLETE, EXIT_PREFLIGHT = 0, 1, 2, 3
+_SENTINEL = object()
 
 
-class _LastProblemCapture(logging.Handler):
-    """Remember the latest WARNING/ERROR message per profile so a skip or failure can say why."""
+# ---------------------------------------------------------------------------------------------
+# manifest
+# ---------------------------------------------------------------------------------------------
 
-    def __init__(self) -> None:
-        super().__init__(level=logging.WARNING)
-        self._lock = threading.Lock()
-        self._messages: Dict[str, str] = {}
+def build_manifest(store: js.JobStore, run_id: str, limit: Optional[int], profile_ids: Optional[Sequence[str]]) -> int:
+    """Persist the selected ids once. The manifest - not the live NULL count - defines the run from then on.
 
-    def emit(self, record: logging.LogRecord) -> None:
-        message = record.getMessage()
-        match = _PROFILE_ID_IN_MESSAGE.search(message)
-        if match:
-            with self._lock:
-                self._messages[match.group(1)] = message
+    Idempotent (INSERT OR IGNORE): an interrupted build is simply started again.
+    """
+    from profile_enrichment import neon_db
 
-    def pop(self, profile_id: str) -> str:
-        with self._lock:
-            return self._messages.pop(profile_id, "")
-
-
-class RunLedger:
-    """Thread-safe per-ID status, persisted so a rerun skips IDs that already finished."""
-
-    def __init__(self, path: Path, fresh: bool):
-        self.path = path
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        self._lock = threading.Lock()
-        self._entries: Dict[str, Dict[str, Any]] = {}
-        if not fresh and path.exists():
-            try:
-                self._entries = json.loads(path.read_text(encoding="utf-8")).get("entries", {})
-            except (json.JSONDecodeError, OSError):
-                logger.warning("NULL_SPECIALTY_LEDGER_UNREADABLE | path=%s | starting_fresh=true", path)
-        self._since_save = 0
-
-    def status_of(self, profile_id: str) -> str | None:
-        with self._lock:
-            return self._entries.get(profile_id, {}).get("status")
-
-    def record(self, profile_id: str, status: str, reason: str = "", updated_fields: List[str] | None = None) -> None:
-        with self._lock:
-            self._entries[profile_id] = {
-                "status": status,
-                "reason": reason,
-                "updated_fields": updated_fields or [],
-                "at": datetime.now(timezone.utc).isoformat(),
-            }
-            self._since_save += 1
-            if self._since_save >= CONFIG["state_save_every"]:
-                self._save_locked()
-
-    def entries_for(self, profile_ids: List[str]) -> Dict[str, Dict[str, Any]]:
-        with self._lock:
-            return {pid: self._entries[pid] for pid in profile_ids if pid in self._entries}
-
-    def flush(self) -> None:
-        with self._lock:
-            self._save_locked()
-
-    def _save_locked(self) -> None:
-        self.path.write_text(json.dumps({"entries": self._entries}, indent=2, sort_keys=True), encoding="utf-8")
-        self._since_save = 0
+    sample = limit if (limit is not None and not profile_ids) else None
+    for page in neon_db.iter_null_specialty_pages(batch_size=5000, profile_ids=profile_ids, sample_size=sample):
+        if limit is not None:
+            page = page[: max(0, limit - store.total_tasks(run_id))]
+        if page:
+            store.add_tasks(run_id, [(r["profile_id"], r["resume_url"]) for r in page])
+            logger.info("MANIFEST_PROGRESS | run=%s | ids=%s", run_id, store.total_tasks(run_id))
+        if limit is not None and store.total_tasks(run_id) >= limit:
+            break
+    store.finish_manifest(run_id)
+    return store.total_tasks(run_id)
 
 
-def fetch_null_specialty_ids() -> List[str | None]:
-    """`SELECT * FROM profiles WHERE specialty IS NULL`, reduced to the key column."""
-    table = CONFIG["neon_table_name"]
-    with get_connection() as conn:
-        with conn.cursor() as cursor:
-            cursor.execute(f"SELECT profile_id FROM {table} WHERE specialty IS NULL ORDER BY profile_id;")
-            return [processor._normalize_candidate(row[0]) or None for row in cursor.fetchall()]
+# ---------------------------------------------------------------------------------------------
+# preflight
+# ---------------------------------------------------------------------------------------------
 
+def preflight(llm_mode: str, require_ocr: bool, check_count: bool = True) -> Dict[str, Any]:
+    from profile_enrichment import extractors, neon_db
 
-def process_one(
-    profile_id: str,
-    state: StateManager,
-    ledger: RunLedger,
-    capture: _LastProblemCapture,
-    disable_ocr: bool,
-) -> str:
-    """Process one ID and always record a terminal status, whatever happens."""
+    report: Dict[str, Any] = {"ok": True, "problems": [], "warnings": []}
     try:
-        before = fetch_profile_by_id(profile_id)
-        if not before:
-            ledger.record(profile_id, FAILED, "profile row no longer exists")
-            return FAILED
+        report["profile_id_unique_index"] = neon_db.verify_profile_id_unique()
+        if not report["profile_id_unique_index"]:
+            report["problems"].append("profiles.profile_id has no single-column unique index: one-row updates are not safe")
+        if check_count:
+            report["db_null_specialty_count"] = neon_db.count_null_specialty()
+    except Exception as exc:  # noqa: BLE001
+        report["problems"].append(f"database: {type(exc).__name__}: {exc}")
 
-        outcome = processor.process_profile_record(
-            before,
-            state,
-            existing=before,
-            comprehensive_reprocess=True,
-            disable_ocr=disable_ocr,
-        )
-        problem = capture.pop(profile_id)
-        qwen_error = consume_ai_call_failure()
-        if qwen_error:
-            # Qwen never answered, so "no specialty found" would be a false conclusion.
-            # Mark it failed so a rerun retries it instead of treating it as finished.
-            reason = f"Qwen call failed: {qwen_error}"
-            ledger.record(profile_id, FAILED, reason)
-            logger.error("NULL_SPECIALTY_QWEN_FAILED | profile_id=%s | reason=%s", profile_id, reason)
-            return FAILED
-        if outcome in ("failed", "invalid"):
-            ledger.record(profile_id, FAILED, problem or f"processor returned {outcome}")
-            return FAILED
+    if llm_mode != "never":
+        ready = inference.check_model_ready()
+        report["text_model"] = {"ok": ready.ok, "detail": ready.detail, "seconds": round(ready.seconds, 1),
+                                "fingerprint": ready.fingerprint, "deployment": ready.deployment}
+        if not ready.ok:
+            report["problems"].append(f"text model not ready: {ready.detail}")
+        loaded = ready.deployment.get("loaded_context")
+        if loaded and loaded < CONFIG["ai_context_tokens"]:
+            report["warnings"].append(
+                f"server loaded context is {loaded} tokens but AI_CONTEXT_TOKENS={CONFIG['ai_context_tokens']}: "
+                "long chunks would be silently cut by the server")
+        if ready.deployment.get("size_vram_bytes") == 0:
+            report["warnings"].append("model is running on CPU (size_vram=0): expect minutes, not seconds, per resume")
+    else:
+        report["text_model"] = {"ok": True, "detail": "skipped (llm-mode never)"}
 
-        after = fetch_profile_by_id(profile_id) or {}
-        changed = [
-            field
-            for field in PROFILE_COLUMNS
-            if processor._normalize_candidate(before.get(field)) != processor._normalize_candidate(after.get(field))
-        ]
-        if processor._normalize_candidate(after.get("specialty")):
-            ledger.record(profile_id, RESOLVED, updated_fields=changed)
-            logger.info("NULL_SPECIALTY_RESOLVED | profile_id=%s | specialty=%s | updated_fields=%s", profile_id, after.get("specialty"), changed)
-            return RESOLVED
-
-        # `problem` is the last unrelated warning (e.g. a rejected state), so it is not the reason.
-        reason = "Qwen and regex found no specialty that is verifiably present in the resume"
-        ledger.record(profile_id, UNRESOLVED, reason, changed)
-        logger.warning("NULL_SPECIALTY_UNRESOLVED | profile_id=%s | reason=%s | updated_fields=%s", profile_id, reason, changed)
-        return UNRESOLVED
-    except Exception as exc:  # pragma: no cover - runtime safety net so no ID is ever dropped
-        logger.exception("NULL_SPECIALTY_FAILED | profile_id=%s | error=%s", profile_id, exc)
-        ledger.record(profile_id, FAILED, f"{type(exc).__name__}: {exc}")
-        return FAILED
+    vision_ok, vision_detail = extractors.check_vision_ready()
+    tess_ok, tess_detail = extractors.check_tesseract_ready()
+    report["ocr"] = {"vision": {"ok": vision_ok, "detail": vision_detail}, "tesseract": {"ok": tess_ok, "detail": tess_detail}}
+    if not (vision_ok or tess_ok):
+        message = "no working OCR engine: scanned resumes will end as extraction_failed (retryable)"
+        (report["problems"] if require_ocr else report["warnings"]).append(message)
+    elif not vision_ok:
+        report["warnings"].append(f"vision OCR unavailable ({vision_detail}); Tesseract will be used")
+    report["ok"] = not report["problems"]
+    return report
 
 
-def build_report(ids: List[str | None], ledger: RunLedger, missing_id_rows: int) -> Dict[str, Any]:
-    real_ids = [pid for pid in ids if pid]
-    entries = ledger.entries_for(real_ids)
-    counts = {status: 0 for status in TERMINAL_STATUSES}
-    for entry in entries.values():
-        counts[entry["status"]] += 1
-    counts[FAILED] += missing_id_rows
-    not_attempted = [pid for pid in real_ids if pid not in entries]
+def print_preflight(report: Dict[str, Any]) -> None:
+    print("\n=== preflight ===")
+    print(json.dumps({k: v for k, v in report.items() if k not in {"problems", "warnings"}}, indent=2, default=str))
+    for item in report["warnings"]:
+        print(f"WARNING: {item}")
+    for item in report["problems"]:
+        print(f"PROBLEM: {item}")
+    print("preflight:", "OK" if report["ok"] else "FAILED")
 
-    return {
-        "total_identified": len(ids),
-        "processed": counts[RESOLVED] + counts[UNRESOLVED],
-        "resolved_specialty_filled": counts[RESOLVED],
-        "rows_with_any_column_updated": sum(1 for e in entries.values() if e["updated_fields"]),
-        "unresolved": counts[UNRESOLVED],
-        "failed": counts[FAILED],
-        "rows_without_profile_id": missing_id_rows,
-        "not_attempted": len(not_attempted),
-        "accounted_for": counts[RESOLVED] + counts[UNRESOLVED] + counts[FAILED] == len(ids),
-        "not_attempted_ids": not_attempted,
-        "unresolved_and_failed": {
-            pid: {"status": e["status"], "reason": e["reason"]}
-            for pid, e in entries.items()
-            if e["status"] in (UNRESOLVED, FAILED)
-        },
+
+# ---------------------------------------------------------------------------------------------
+# runner
+# ---------------------------------------------------------------------------------------------
+
+class Runner:
+    """Three bounded stages (fetch/extract, model, database) joined by bounded queues.
+
+    Backpressure: a fetch worker blocks on `put` when the model queue is full, so it stops *claiming* tasks;
+    nothing piles up in memory and no lease is taken for work that cannot start soon.
+    """
+
+    def __init__(self, store: js.JobStore, pipeline: Pipeline, run_id: str, *, apply: bool, fetch_workers: int,
+                 model_workers: int, write_workers: int, limit: Optional[int], prepared_only: bool = False,
+                 profile_ids: Optional[Sequence[str]] = None):
+        self.store, self.pipeline, self.run_id, self.apply = store, pipeline, run_id, apply
+        self.fetch_workers, self.model_workers, self.write_workers = fetch_workers, model_workers, write_workers
+        self.limit, self.prepared_only, self.profile_ids = limit, prepared_only, profile_ids
+        self.invocation = uuid.uuid4().hex[:10]
+        self.owner = f"{os.getpid()}-{self.invocation}"
+        self.stop = threading.Event()
+        self.q_model: "queue.Queue[Any]" = queue.Queue(maxsize=max(2, model_workers * 2))
+        self.q_write: "queue.Queue[Any]" = queue.Queue(maxsize=max(4, write_workers * 4))
+        self._budget = limit
+        self._lock = threading.Lock()
+        self.processed = 0
+        self.fingerprint = pipeline.fingerprint()
+        self.started = time.time()
+
+    # -- helpers -------------------------------------------------------------------------------
+    def _take_budget(self) -> bool:
+        with self._lock:
+            if self._budget is None:
+                return True
+            if self._budget <= 0:
+                return False
+            self._budget -= 1
+            return True
+
+    def _put(self, q: "queue.Queue[Any]", item: Any) -> bool:
+        while not self.stop.is_set():
+            try:
+                q.put(item, timeout=1.0)
+                return True
+            except queue.Full:
+                continue
+        return False
+
+    def _beat(self, work: Work, stage: str) -> bool:
+        try:
+            self.store.heartbeat(work.run_id, work.profile_id, work.owner, CONFIG["lease_seconds"], stage)
+            return True
+        except js.LeaseLost:
+            logger.warning("LEASE_LOST | profile_id=%s | stage=%s | result discarded", work.profile_id, stage)
+            return False
+
+    def _finish(self, work: Work) -> None:
+        proposal = work.proposal
+        try:
+            self.store.finish(
+                work.run_id, work.profile_id, work.owner, work.outcome or js.PENDING, work.reason,
+                invocation=self.invocation, doc_sha256=work.doc_sha or None, model_fp=self.fingerprint,
+                prompt_version=PROMPT_VERSION, qwen_status=work.qwen_status or None, fields_written=work.fields_written,
+                screen_reason_set=work.screen_reason_set, proposal=proposal,
+            )
+            if proposal:
+                for name, item in (proposal.get("reviews") or {}).items():
+                    self.store.add_proposal(work.run_id, work.profile_id, name, item["old"], item["value"],
+                                            item["evidence"], item["page"], item["source"])
+        except js.LeaseLost:
+            logger.warning("LEASE_LOST | profile_id=%s | outcome=%s discarded", work.profile_id, work.outcome)
+            return
+        with self._lock:
+            self.processed += 1
+            done = self.processed
+        logger.info("TASK_DONE | profile_id=%s | outcome=%s | reason=%s | fields_written=%s | qwen=%s | timings=%s",
+                    work.profile_id, work.outcome, (work.reason or "")[:120], work.fields_written,
+                    work.qwen_status or "-", {k: round(v, 1) for k, v in work.timings.items()})
+        if done % 25 == 0:
+            logger.info("PROGRESS | run=%s | done_this_invocation=%s | counts=%s", work.run_id, done,
+                        {k: v for k, v in self.store.outcome_counts(work.run_id).items() if v})
+
+    def _prepared(self, work: Work) -> None:
+        try:
+            self.store.mark_prepared(work.run_id, work.profile_id, work.owner, work.proposal, invocation=self.invocation,
+                                     doc_sha256=work.doc_sha or None, model_fp=self.fingerprint,
+                                     prompt_version=PROMPT_VERSION, qwen_status=work.qwen_status or None)
+            for name, item in (work.proposal.get("reviews") or {}).items():
+                self.store.add_proposal(work.run_id, work.profile_id, name, item["old"], item["value"],
+                                        item["evidence"], item["page"], item["source"])
+        except js.LeaseLost:
+            logger.warning("LEASE_LOST | profile_id=%s | prepared proposal discarded", work.profile_id)
+            return
+        with self._lock:
+            self.processed += 1
+        spec = (work.proposal["fields"].get("specialty") or {}).get("value")
+        logger.info("TASK_PREPARED | profile_id=%s | specialty=%s | other_fields=%s | qwen=%s | timings=%s",
+                    work.profile_id, spec, [f for f in work.proposal["fields"] if f != "specialty"],
+                    work.qwen_status or "-", {k: round(v, 1) for k, v in work.timings.items()})
+
+    # -- workers -------------------------------------------------------------------------------
+    def _fetch_worker(self) -> None:
+        states = (js.STATE_PREPARED,) if self.prepared_only else (
+            (js.STATE_PENDING, js.STATE_PREPARED) if self.apply else (js.STATE_PENDING,))
+        while not self.stop.is_set():
+            if not self._take_budget():
+                return
+            tasks = self.store.claim(self.run_id, self.owner, CONFIG["lease_seconds"], 1, states, self.profile_ids)
+            if not tasks:
+                with self._lock:  # nothing left to claim: give the unused budget back and stop
+                    if self._budget is not None:
+                        self._budget += 1
+                return
+            task = tasks[0]
+            work = Work(self.run_id, task.profile_id, task.resume_ref, self.owner, self.invocation)
+            try:
+                if task.proposal is not None and self.apply:
+                    work.proposal, work.doc_sha = task.proposal, task.doc_sha256 or ""
+                    work.qwen_status = task.proposal.get("qwen_status", "")
+                    if not self._put(self.q_write, work):
+                        return
+                    continue
+                if not self._beat(work, "fetch"):
+                    continue
+                self.pipeline.fetch_stage(work)
+            except Exception as exc:  # noqa: BLE001 - one bad resume must never kill the run
+                logger.exception("FETCH_STAGE_ERROR | profile_id=%s", task.profile_id)
+                work.finish_early(js.EXTRACTION_FAILED, f"unexpected: {type(exc).__name__}: {exc}"[:400])
+            if work.outcome is not None:
+                self._finish(work)
+            elif not self._put(self.q_model, work):
+                self.store.release(self.run_id, work.profile_id, self.owner)
+                return
+
+    def _model_worker(self) -> None:
+        while True:
+            work = self.q_model.get()
+            if work is _SENTINEL:
+                return
+            try:
+                if self._beat(work, "infer"):
+                    self.pipeline.infer_stage(work)
+                else:
+                    continue
+            except Exception as exc:  # noqa: BLE001
+                logger.exception("INFER_STAGE_ERROR | profile_id=%s", work.profile_id)
+                work.finish_early(js.INFERENCE_FAILED, f"unexpected: {type(exc).__name__}: {exc}"[:400])
+            if work.outcome is not None and not (work.proposal or {}).get("fields"):
+                self._finish(work)
+            elif not self._put(self.q_write, work):
+                self.store.release(self.run_id, work.profile_id, self.owner)
+
+    def _write_worker(self) -> None:
+        while True:
+            work = self.q_write.get()
+            if work is _SENTINEL:
+                return
+            try:
+                if not self._beat(work, "write"):
+                    continue
+                if self.apply:
+                    self.pipeline.apply_proposal(work)
+                    self._finish(work)
+                else:
+                    self._prepared(work)
+            except Exception as exc:  # noqa: BLE001
+                logger.exception("WRITE_STAGE_ERROR | profile_id=%s", work.profile_id)
+                work.finish_early(js.UPDATE_FAILED, f"unexpected: {type(exc).__name__}: {exc}"[:400])
+                self._finish(work)
+
+    # -- run -----------------------------------------------------------------------------------
+    def run(self) -> None:
+        def on_signal(signum, _frame):
+            if self.stop.is_set():
+                raise KeyboardInterrupt
+            logger.warning("SHUTDOWN_REQUESTED | finishing in-flight work, releasing unclaimed leases (Ctrl-C again to abort)")
+            self.stop.set()
+
+        previous = signal.signal(signal.SIGINT, on_signal) if threading.current_thread() is threading.main_thread() else None
+        fetchers = [threading.Thread(target=self._fetch_worker, name=f"fetch-{i}", daemon=True) for i in range(self.fetch_workers)]
+        modelers = [threading.Thread(target=self._model_worker, name=f"model-{i}", daemon=True) for i in range(self.model_workers)]
+        writers = [threading.Thread(target=self._write_worker, name=f"write-{i}", daemon=True) for i in range(self.write_workers)]
+        try:
+            for thread in fetchers + modelers + writers:
+                thread.start()
+            for thread in fetchers:
+                thread.join()
+            for _ in modelers:
+                self.q_model.put(_SENTINEL)
+            for thread in modelers:
+                thread.join()
+            for _ in writers:
+                self.q_write.put(_SENTINEL)
+            for thread in writers:
+                thread.join()
+        finally:
+            self.stop.set()
+            released = self.store.release_owner(self.run_id, self.owner)
+            if released:
+                logger.warning("LEASES_RELEASED | count=%s", released)
+            if previous is not None:
+                signal.signal(signal.SIGINT, previous)
+
+
+# ---------------------------------------------------------------------------------------------
+# reporting
+# ---------------------------------------------------------------------------------------------
+
+def exit_status(store: js.JobStore, run_id: str) -> int:
+    counts = store.outcome_counts(run_id)
+    run = store.get_run(run_id)
+    dry = run["mode"] == "dry-run"
+    failures = sum(counts[o] for o in js.FAILURE_OUTCOMES)
+    # a row that simply was filled by someone else in the meantime is not a failure
+    benign = sum(1 for t in store.tasks_with_outcome(run_id, [js.CONCURRENT_CHANGE]) if t["reason"].startswith("specialty_already_filled"))
+    failures -= benign
+    unfinished = counts[js.PENDING] + counts["claimed"] + (0 if dry else counts["prepared"])
+    if not run["manifest_complete"] or unfinished:
+        return EXIT_INCOMPLETE
+    return EXIT_FAILURES if failures else EXIT_OK
+
+
+def build_report(store: js.JobStore, run_id: str, invocation: Optional[str] = None) -> Dict[str, Any]:
+    run = store.get_run(run_id)
+    original = store.outcome_counts(run_id)
+    report: Dict[str, Any] = {
+        "run_id": run_id, "mode": run["mode"], "selection": run["selection_sql"],
+        "db_null_count_when_run_started": run["db_count_at_start"], "manifest_size": store.total_tasks(run_id),
+        "manifest_complete": bool(run["manifest_complete"]),
+        "original_run_totals": {k: v for k, v in original.items()},
+        "terminal_outcomes": sum(v for k, v in original.items() if k not in (js.PENDING, "claimed", "prepared")),
+        "not_attempted_pending": original[js.PENDING] + original["claimed"],
+        "specialty_filled_verified": original[js.VERIFIED_UPDATED],
+        "fields_written_by_name": store.field_write_counts(run_id),
+        "prepared_not_applied": original["prepared"], "prepared_fields": store.prepared_field_counts(run_id),
+        "unresolved_and_failure_reasons": [{"outcome": o, "reason": r, "count": n} for o, r, n in store.reason_counts(run_id)[:40]],
+        "stage_timings": store.timing_summary(run_id),
+        "throughput_all_invocations": store.throughput(run_id),
+        "exit_status": exit_status(store, run_id),
     }
+    if invocation:
+        report["this_invocation"] = {"id": invocation, "totals": {k: v for k, v in store.outcome_counts(run_id, invocation).items() if v},
+                                     "throughput": store.throughput(run_id, invocation)}
+    remaining = original[js.PENDING] + original["claimed"] + (original["prepared"] if run["mode"] != "dry-run" else 0)
+    rate = (report.get("this_invocation") or {}).get("throughput", {}).get("per_minute") or report["throughput_all_invocations"]["per_minute"]
+    if remaining and rate:
+        hours = remaining / rate / 60
+        report["estimated_remaining"] = {"tasks": remaining, "at_per_minute": rate, "hours": round(hours, 1), "days": round(hours / 24, 1)}
+    return report
 
 
-def write_report_files(report: Dict[str, Any], log_dir: Path) -> tuple[Path, Path]:
+def print_report(report: Dict[str, Any]) -> None:
+    print(f"\n=== run {report['run_id']} ({report['mode']}) ===")
+    print(f"selection                 : {report['selection']}")
+    print(f"DB NULL count at start    : {report['db_null_count_when_run_started']}")
+    print(f"manifest (original run)   : {report['manifest_size']}  complete={report['manifest_complete']}")
+    print("-- original-run totals (all invocations) --")
+    for name, value in report["original_run_totals"].items():
+        if value:
+            print(f"  {name:24s}: {value}")
+    print(f"  specialty verified      : {report['specialty_filled_verified']}   "
+          f"(terminal outcomes {report['terminal_outcomes']}, not attempted {report['not_attempted_pending']})")
+    print(f"  fields written by name  : {report['fields_written_by_name']}")
+    if report["prepared_not_applied"]:
+        print(f"  prepared (not applied)  : {report['prepared_not_applied']}  fields={report['prepared_fields']}")
+    if "this_invocation" in report:
+        inv = report["this_invocation"]
+        print(f"-- this invocation ({inv['id']}) --\n  {inv['totals']}\n  throughput: {inv['throughput']}")
+    print("-- reasons (non-updated) --")
+    for item in report["unresolved_and_failure_reasons"][:15]:
+        print(f"  {item['count']:6d}  {item['outcome']:22s} {item['reason']}")
+    print("-- stage timings (seconds) --")
+    for stage, stats in report["stage_timings"].items():
+        print(f"  {stage:14s} n={int(stats['count']):6d} mean={stats['mean_s']:8.2f} p50={stats['p50_s']:8.2f} p95={stats['p95_s']:8.2f} total={stats['total_s']}")
+    if "estimated_remaining" in report:
+        print(f"-- estimate -- {report['estimated_remaining']}")
+    print(f"exit status: {report['exit_status']} (0 ok, 1 failures, 2 incomplete, 3 preflight failed)")
+
+
+def write_report_files(store: js.JobStore, run_id: str, report: Dict[str, Any]) -> List[Path]:
+    log_dir = Path(CONFIG["log_dir"])
     log_dir.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    json_path = log_dir / f"null_specialty_report_{stamp}.json"
-    csv_path = log_dir / f"null_specialty_unresolved_{stamp}.csv"
-    json_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
+    json_path = log_dir / f"null_specialty_report_{run_id}_{stamp}.json"
+    csv_path = log_dir / f"null_specialty_not_updated_{run_id}_{stamp}.csv"
+    json_path.write_text(json.dumps(report, indent=2, default=str), encoding="utf-8")
     with csv_path.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.writer(handle)
-        writer.writerow(["profile_id", "status", "reason"])
-        for pid, item in report["unresolved_and_failed"].items():
-            writer.writerow([pid, item["status"], item["reason"]])
-    return json_path, csv_path
+        writer.writerow(["profile_id", "outcome", "reason", "attempts", "qwen_status", "fields_written"])
+        for row in store.tasks_with_outcome(run_id, [o for o in js.OUTCOMES if o not in (js.VERIFIED_UPDATED, js.PENDING)]):
+            writer.writerow([row["profile_id"], row["outcome"], row["reason"], row["attempts"], row["qwen_status"], row["fields_written"]])
+    return [json_path, csv_path]
 
 
-def print_report(report: Dict[str, Any], json_path: Path, csv_path: Path) -> None:
-    print("\n=== NULL specialty run report ===")
-    print(f"Total records identified : {report['total_identified']}")
-    print(f"Processed                : {report['processed']}")
-    print(f"  specialty filled       : {report['resolved_specialty_filled']}")
-    print(f"  any column updated     : {report['rows_with_any_column_updated']}")
-    print(f"Unresolved (logged)      : {report['unresolved']}")
-    print(f"Failed                   : {report['failed']}")
-    print(f"Not attempted            : {report['not_attempted']}")
-    print(f"All IDs accounted for    : {report['accounted_for']}")
-    print(f"Report JSON              : {json_path}")
-    print(f"Unresolved/failed CSV    : {csv_path}")
+# ---------------------------------------------------------------------------------------------
+# commands
+# ---------------------------------------------------------------------------------------------
+
+def _parse_ids(args) -> Optional[List[str]]:
+    ids: List[str] = []
+    if getattr(args, "profile_ids", None):
+        ids += [x.strip() for x in args.profile_ids.split(",") if x.strip()]
+    if getattr(args, "profile_ids_file", None):
+        ids += [line.strip() for line in Path(args.profile_ids_file).read_text(encoding="utf-8").splitlines() if line.strip()]
+    return ids or None
 
 
-def check_qwen_reachable() -> None:
-    """Stop before touching 100k+ rows if the Qwen endpoint is down."""
-    if not CONFIG["ai_extractor_enabled"]:
-        raise SystemExit("AI_EXTRACTOR_ENABLED is false; this run needs Qwen.")
-    run_ai_extraction(None, "Jane Smith, MD. Cardiology. Dallas, TX.")
-    error = consume_ai_call_failure()
-    if error:
-        raise SystemExit(f"Qwen is not reachable at {CONFIG['local_model_base_url']}: {error}")
+def _unfinished_run(store: js.JobStore) -> Optional[Any]:
+    run = store.latest_run()
+    if not run:
+        return None
+    counts = store.outcome_counts(run["run_id"])
+    if not run["manifest_complete"] or counts[js.PENDING] or counts["claimed"] or counts["prepared"]:
+        return run
+    return None
 
 
-def run(workers: int, disable_ocr: bool, fresh: bool, retry_failed: bool) -> Dict[str, Any]:
-    check_qwen_reachable()
-    ids = fetch_null_specialty_ids()
-    missing_id_rows = sum(1 for pid in ids if pid is None)
-    real_ids = [pid for pid in ids if pid]
-    logger.info("NULL_SPECIALTY_CANDIDATES_FOUND | count=%s | rows_without_profile_id=%s", len(ids), missing_id_rows)
+def cmd_run(args, resume_only: bool = False) -> int:
+    from profile_enrichment import neon_db
 
-    # Every ID is re-evaluated through Qwen; the processed-state skip must not hide any of them.
-    CONFIG["skip_already_processed"] = False
+    store = js.JobStore()
+    profile_ids = _parse_ids(args)
+    apply = bool(args.apply)
 
-    root = Path(CONFIG["state_file"]).parent
-    ledger = RunLedger(root / "null_specialty_run.json", fresh=fresh)
-    state = StateManager(str(root / "null_specialty_state.json"))
-    capture = _LastProblemCapture()
-    logger.addHandler(capture)
+    pipeline = Pipeline(store, llm_mode=args.llm_mode, ocr_enabled=not args.no_ocr,
+                        refresh_documents=args.refresh_documents, max_chunks=args.max_chunks)
 
-    def already_done(pid: str) -> bool:
-        status = ledger.status_of(pid)
-        return status in (RESOLVED, UNRESOLVED) or (status == FAILED and not retry_failed)
+    run = store.get_run(args.run_id) if args.run_id else (None if args.new_run else _unfinished_run(store))
+    if resume_only and run is None:
+        print("Nothing to resume: no unfinished run found (use `status` to list runs).")
+        return EXIT_PREFLIGHT
+    if args.run_id and run is None:
+        print(f"Unknown run id {args.run_id}")
+        return EXIT_PREFLIGHT
 
-    todo = [pid for pid in real_ids if not already_done(pid)]
-    if len(todo) != len(real_ids):
-        logger.info("NULL_SPECIALTY_RESUME | already_finished=%s | remaining=%s", len(real_ids) - len(todo), len(todo))
+    if not args.skip_preflight:
+        full_manifest = run is None and args.limit is None and not profile_ids
+        report = preflight(args.llm_mode, args.require_ocr, check_count=full_manifest)
+        print_preflight(report)
+        if not report["ok"]:
+            return EXIT_PREFLIGHT
+        db_count = report.get("db_null_specialty_count")
+    else:
+        db_count = None
 
-    done = 0
+    if run is None:
+        params = {"limit": args.limit, "profile_ids": profile_ids, "llm_mode": args.llm_mode, "no_ocr": args.no_ocr}
+        run_id = store.create_run(neon_db.selection_description(), params, "apply" if apply else "dry-run",
+                                  db_count, pipeline.fingerprint(), PROMPT_VERSION)
+        print(f"Created run {run_id}")
+    else:
+        run_id = run["run_id"]
+        print(f"Resuming run {run_id} (original manifest kept; not rebuilt from the current NULL rows)")
+        if apply and run["mode"] == "dry-run":
+            with store._tx() as conn:
+                conn.execute("UPDATE runs SET mode='apply' WHERE run_id=?", (run_id,))
+
+    run = store.get_run(run_id)
+    if not run["manifest_complete"]:
+        limit = json.loads(run["params_json"]).get("limit")
+        ids = json.loads(run["params_json"]).get("profile_ids")
+        total = build_manifest(store, run_id, limit, ids)
+        print(f"Manifest: {total} profile_ids persisted")
+
+    reclaimed = store.reclaim_expired(run_id)
+    requeued = {}
+    if args.retry_failed:
+        requeued["failed"] = store.requeue(run_id, js.FAILURE_OUTCOMES)
+    if args.retry_unresolved:
+        requeued["unresolved"] = store.requeue(run_id, js.UNRESOLVED_OUTCOMES)
+    if args.retry_stale:
+        requeued["stale"] = store.requeue(run_id, js.FAILURE_OUTCOMES + js.UNRESOLVED_OUTCOMES, stale_only=True,
+                                          model_fp=pipeline.fingerprint(), prompt_version=PROMPT_VERSION)
+    if reclaimed or requeued:
+        print(f"Re-queued: expired_leases={reclaimed} {requeued}")
+
+    runner = Runner(store, pipeline, run_id, apply=apply, fetch_workers=args.fetch_workers,
+                    model_workers=args.model_concurrency, write_workers=args.write_workers, limit=args.limit,
+                    prepared_only=False, profile_ids=profile_ids)
+    print(f"Mode: {'APPLY (writes to the database)' if apply else 'DRY RUN (no database writes; use --apply to write)'}"
+          f" | fetch={args.fetch_workers} model={args.model_concurrency} write={args.write_workers} | llm={args.llm_mode}")
     try:
-        with ThreadPoolExecutor(max_workers=max(1, workers)) as executor:
-            futures = {executor.submit(process_one, pid, state, ledger, capture, disable_ocr): pid for pid in todo}
-            for future in as_completed(futures):
-                done += 1
-                future.result()
-                if done % 25 == 0 or done == len(todo):
-                    logger.info("NULL_SPECIALTY_PROGRESS | done=%s | total_this_run=%s", done, len(todo))
-    finally:
-        logger.removeHandler(capture)
-        ledger.flush()
-        state.flush()
+        runner.run()
+    except KeyboardInterrupt:
+        print("Aborted; unfinished leases will expire and be reclaimed on the next run.")
 
-    return build_report(ids, ledger, missing_id_rows)
+    report = build_report(store, run_id, runner.invocation)
+    print_report(report)
+    paths = write_report_files(store, run_id, report)
+    print("Report files:", *paths, sep="\n  ")
+    return report["exit_status"]
 
 
-def main() -> int:
-    parser = argparse.ArgumentParser(description="Fill every profile with specialty IS NULL using Qwen.")
-    parser.add_argument("--workers", type=int, default=CONFIG["worker_count"], help="Concurrent workers (a single local Qwen server usually serves 1-2 well).")
-    parser.add_argument("--no-ocr", action="store_true", help="Skip OCR; use native text and Qwen only.")
-    parser.add_argument("--fresh", action="store_true", help="Ignore the saved run ledger and process every ID again.")
-    parser.add_argument("--no-retry-failed", action="store_true", help="On resume, do not retry IDs that previously failed.")
-    args = parser.parse_args()
+def cmd_apply(args) -> int:
+    store = js.JobStore()
+    run = store.get_run(args.run_id) if args.run_id else store.latest_run()
+    if not run:
+        print("No run found.")
+        return EXIT_PREFLIGHT
+    run_id = run["run_id"]
+    if not args.yes:
+        counts = store.outcome_counts(run_id)
+        print(f"Run {run_id}: {counts['prepared']} prepared proposals would be written "
+              f"(fields: {store.prepared_field_counts(run_id)}). Re-run with --apply to write them.")
+        return EXIT_OK
+    pipeline = Pipeline(store, llm_mode="never", ocr_enabled=False)
+    with store._tx() as conn:
+        conn.execute("UPDATE runs SET mode='apply' WHERE run_id=?", (run_id,))
+    store.reclaim_expired(run_id)
+    runner = Runner(store, pipeline, run_id, apply=True, fetch_workers=1, model_workers=1,
+                    write_workers=args.write_workers, limit=args.limit, prepared_only=True)
+    runner.run()
+    report = build_report(store, run_id, runner.invocation)
+    print_report(report)
+    write_report_files(store, run_id, report)
+    return report["exit_status"]
 
-    report = run(
-        workers=args.workers,
-        disable_ocr=args.no_ocr,
-        fresh=args.fresh,
-        retry_failed=not args.no_retry_failed,
-    )
-    json_path, csv_path = write_report_files(report, Path(CONFIG["log_dir"]))
-    print_report(report, json_path, csv_path)
-    return 0 if report["accounted_for"] and not report["not_attempted"] else 1
+
+def cmd_status(args) -> int:
+    store = js.JobStore()
+    run = store.get_run(args.run_id) if args.run_id else store.latest_run()
+    if not run:
+        print("No runs recorded yet.")
+        return EXIT_OK
+    report = build_report(store, run["run_id"])
+    if args.json:
+        print(json.dumps(report, indent=2, default=str))
+    else:
+        print_report(report)
+        others = [r["run_id"] for r in store.list_runs() if r["run_id"] != run["run_id"]]
+        if others:
+            print("other runs:", ", ".join(others[:10]))
+    return report["exit_status"]
+
+
+def cmd_export_review(args) -> int:
+    store = js.JobStore()
+    run = store.get_run(args.run_id) if args.run_id else store.latest_run()
+    rows = store.proposals(run["run_id"], status="open")
+    with open(args.out, "w", newline="", encoding="utf-8") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(["profile_id", "field", "current_value", "proposed_value", "evidence", "page", "source", "decision"])
+        for row in rows:
+            writer.writerow([row["profile_id"], row["field"], row["current_value"], row["proposed_value"], row["evidence"],
+                             row["page"], row["source"], ""])
+    print(f"Wrote {len(rows)} correction proposals to {args.out}. Put 'approve' in the decision column, then run apply-review.")
+    return EXIT_OK
+
+
+def cmd_apply_review(args) -> int:
+    from profile_enrichment import neon_db
+    from profile_enrichment.neon_db import FieldChange
+
+    store = js.JobStore()
+    applied = skipped = 0
+    with open(args.file, newline="", encoding="utf-8") as handle:
+        for row in csv.DictReader(handle):
+            if (row.get("decision") or "").strip().lower() != "approve":
+                continue
+            pid, name, new = row["profile_id"], row["field"], row["proposed_value"]
+            current = neon_db.fetch_profile_by_id(pid)
+            if current is None or name not in neon_db.PROFILE_COLUMNS or name in {"phone", "specialty"}:
+                skipped += 1
+                continue
+            if str(current.get(name) or "") != (row.get("current_value") or ""):
+                print(f"SKIP {pid}.{name}: value changed since the proposal was made")
+                skipped += 1
+                continue
+            if not args.apply:
+                print(f"WOULD SET {pid}.{name}: {current.get(name)!r} -> {new!r}")
+                continue
+            result = neon_db.guarded_update(pid, {name: FieldChange(current.get(name), new)})
+            if result.verified:
+                store.record_write("review", pid, name, current.get(name), new, row.get("evidence") or "", int(row.get("page") or 0), "review")
+                applied += 1
+            else:
+                skipped += 1
+    print(f"applied={applied} skipped={skipped}" + ("" if args.apply else " (dry run; add --apply)"))
+    return EXIT_OK
+
+
+def cmd_export_unresolved(args) -> int:
+    store = js.JobStore()
+    run = store.get_run(args.run_id) if args.run_id else store.latest_run()
+    rows = store.tasks_with_outcome(run["run_id"], [o for o in js.OUTCOMES if o not in (js.VERIFIED_UPDATED, js.PENDING)])
+    with open(args.out, "w", newline="", encoding="utf-8") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(["profile_id", "outcome", "reason", "attempts", "qwen_status"])
+        for row in rows:
+            writer.writerow([row["profile_id"], row["outcome"], row["reason"], row["attempts"], row["qwen_status"]])
+    print(f"Wrote {len(rows)} rows to {args.out}")
+    return EXIT_OK
+
+
+def cmd_rollback(args) -> int:
+    """Undo this run's writes where the column still holds the value we wrote (never touches later changes)."""
+    from profile_enrichment import neon_db
+
+    store = js.JobStore()
+    writes = store.writes_for_run(args.run_id)
+    reverted = skipped = 0
+    for w in writes:
+        if not args.apply:
+            print(f"WOULD REVERT {w['profile_id']}.{w['field']}: {w['new_value']!r} -> {w['old_value']!r}")
+            continue
+        if neon_db.revert_field(w["profile_id"], w["field"], w["new_value"], w["old_value"]):
+            reverted += 1
+        else:
+            skipped += 1
+    print(f"{len(writes)} writes recorded; reverted={reverted} skipped(already changed)={skipped}"
+          + ("" if args.apply else " (dry run; add --apply)"))
+    return EXIT_OK
+
+
+def cmd_refresh_vocabulary(args) -> int:
+    from profile_enrichment import neon_db
+    from profile_enrichment.specialty_lexicon import DEFAULT_VOCABULARY_PATH
+
+    with neon_db.transaction(read_only=True) as conn, conn.cursor() as cursor:
+        cursor.execute("SET LOCAL statement_timeout = 300000")
+        cursor.execute("SELECT specialty, count(*) FROM " + neon_db._table_sql() +
+                       " WHERE specialty IS NOT NULL GROUP BY 1 HAVING count(*) >= 20 ORDER BY 2 DESC")
+        rows = cursor.fetchall()
+    with open(DEFAULT_VOCABULARY_PATH, "w", newline="", encoding="utf-8") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(["specialty", "count"])
+        writer.writerows(rows)
+    print(f"Wrote {len(rows)} labels to {DEFAULT_VOCABULARY_PATH}")
+    return EXIT_OK
+
+
+def cmd_preflight(args) -> int:
+    report = preflight(args.llm_mode, args.require_ocr, check_count=not args.skip_count)
+    print_preflight(report)
+    return EXIT_OK if report["ok"] else EXIT_PREFLIGHT
+
+
+# ---------------------------------------------------------------------------------------------
+# argument parsing
+# ---------------------------------------------------------------------------------------------
+
+def _add_run_options(p: argparse.ArgumentParser) -> None:
+    p.add_argument("--apply", action="store_true", help="Write to the database. Without it nothing is written (dry run).")
+    p.add_argument("--limit", type=int, default=None, help="Only this many profile_ids (manifest and this invocation).")
+    p.add_argument("--profile-ids", help="Comma-separated profile_ids to process (must still match specialty IS NULL).")
+    p.add_argument("--profile-ids-file", help="File with one profile_id per line.")
+    p.add_argument("--run-id", help="Resume a specific run instead of the latest unfinished one.")
+    p.add_argument("--new-run", action="store_true", help="Start a new run even if an unfinished one exists.")
+    p.add_argument("--retry-failed", action="store_true", help="Re-queue download/extraction/inference/update failures and concurrent changes.")
+    p.add_argument("--retry-unresolved", action="store_true", help="Re-queue insufficient_evidence, validation_failed and no_resume.")
+    p.add_argument("--retry-stale", action="store_true", help="Re-queue unresolved/failed tasks decided under a different model, prompt or mode.")
+    p.add_argument("--refresh-documents", action="store_true", help="Ignore cached bytes/text (re-download; detects changed resumes).")
+    p.add_argument("--llm-mode", choices=["auto", "always", "never"], default="auto",
+                   help="auto: Qwen only where deterministic evidence is not conclusive; always: every resume; never: rules only.")
+    p.add_argument("--max-chunks", type=int, default=None, help="Cap model chunks per resume (default AI_MAX_CHUNKS).")
+    p.add_argument("--fetch-workers", type=int, default=CONFIG["worker_count"], help="Download/extract/OCR concurrency.")
+    p.add_argument("--model-concurrency", type=int, default=1, help="Concurrent model requests (keep 1 for a single CPU/GPU server).")
+    p.add_argument("--write-workers", type=int, default=2, help="Database write concurrency (<= DB_POOL_MAX).")
+    p.add_argument("--no-ocr", action="store_true", help="Disable OCR (scanned pages then end as extraction_failed).")
+    p.add_argument("--require-ocr", action="store_true", help="Fail preflight if no OCR engine works.")
+    p.add_argument("--skip-preflight", action="store_true", help="Skip readiness checks (not recommended).")
+
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = parser.add_subparsers(dest="command")
+    _add_run_options(sub.add_parser("run", help="Select, prepare and (with --apply) write. Resumes an unfinished run."))
+    _add_run_options(sub.add_parser("resume", help="Resume the latest unfinished run (fails if there is none)."))
+    p = sub.add_parser("apply", help="Write proposals prepared by an earlier dry run (no model calls).")
+    p.add_argument("--run-id"); p.add_argument("--yes", action="store_true", help="Actually write (otherwise just summarises).")
+    p.add_argument("--limit", type=int); p.add_argument("--write-workers", type=int, default=2)
+    p = sub.add_parser("status", help="Original-run totals, this run's reasons, timings and a completion estimate.")
+    p.add_argument("--run-id"); p.add_argument("--json", action="store_true")
+    p = sub.add_parser("preflight", help="Check database, text model, vision/Tesseract OCR.")
+    p.add_argument("--llm-mode", choices=["auto", "always", "never"], default="auto")
+    p.add_argument("--require-ocr", action="store_true"); p.add_argument("--skip-count", action="store_true")
+    p = sub.add_parser("export-review", help="Write corrections to populated fields for human review.")
+    p.add_argument("--run-id"); p.add_argument("--out", required=True)
+    p = sub.add_parser("apply-review", help="Apply rows marked 'approve' in an exported review CSV.")
+    p.add_argument("--file", required=True); p.add_argument("--apply", action="store_true")
+    p = sub.add_parser("export-unresolved", help="CSV of every task that did not end verified_updated.")
+    p.add_argument("--run-id"); p.add_argument("--out", required=True)
+    p = sub.add_parser("rollback", help="Revert a run's writes (only where the value is still what we wrote).")
+    p.add_argument("--run-id", required=True); p.add_argument("--apply", action="store_true")
+    sub.add_parser("refresh-vocabulary", help="Rebuild data/specialty_vocabulary.csv from the database.")
+
+    raw = list(sys.argv[1:] if argv is None else argv)
+    if not raw or raw[0].startswith("-"):
+        raw = ["run"] + raw  # `python -m ... --limit 100` means `run --limit 100`
+    args = parser.parse_args(raw)
+
+    handlers = {
+        "run": cmd_run, "resume": lambda a: cmd_run(a, resume_only=True), "apply": cmd_apply, "status": cmd_status,
+        "preflight": cmd_preflight, "export-review": cmd_export_review, "apply-review": cmd_apply_review,
+        "export-unresolved": cmd_export_unresolved, "rollback": cmd_rollback, "refresh-vocabulary": cmd_refresh_vocabulary,
+    }
+    return handlers[args.command](args)
 
 
 if __name__ == "__main__":

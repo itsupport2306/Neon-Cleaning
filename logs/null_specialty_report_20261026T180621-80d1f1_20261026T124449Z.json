@@ -1,0 +1,148 @@
+{
+  "run_id": "20261026T180621-80d1f1",
+  "mode": "dry-run",
+  "selection": "SELECT * FROM profiles WHERE specialty IS NULL",
+  "db_null_count_when_run_started": null,
+  "manifest_size": 12,
+  "manifest_complete": true,
+  "original_run_totals": {
+    "verified_updated": 0,
+    "no_resume": 0,
+    "download_failed": 0,
+    "extraction_failed": 0,
+    "inference_failed": 0,
+    "validation_failed": 1,
+    "insufficient_evidence": 8,
+    "concurrent_change": 0,
+    "update_failed": 0,
+    "pending": 0,
+    "prepared": 3,
+    "claimed": 0
+  },
+  "terminal_outcomes": 9,
+  "not_attempted_pending": 0,
+  "specialty_filled_verified": 0,
+  "fields_written_by_name": {},
+  "prepared_not_applied": 3,
+  "prepared_fields": {
+    "phone": 1,
+    "specialty": 2
+  },
+  "unresolved_and_failure_reasons": [
+    {
+      "outcome": "insufficient_evidence",
+      "reason": "competing_specialties [('Registered Nurse', 10.0), ('RN Case Manager', 4.5), ('P",
+      "count": 1
+    },
+    {
+      "outcome": "insufficient_evidence",
+      "reason": "no_healthcare_context",
+      "count": 1
+    },
+    {
+      "outcome": "insufficient_evidence",
+      "reason": "specialty_not_in_taxonomy: ['Data Security Cloud Services Voice and MPLS']",
+      "count": 1
+    },
+    {
+      "outcome": "insufficient_evidence",
+      "reason": "specialty_not_in_taxonomy: ['Dietary Aide']",
+      "count": 1
+    },
+    {
+      "outcome": "insufficient_evidence",
+      "reason": "specialty_not_in_taxonomy: ['Logistics, Transportation, and Warehouse Operations",
+      "count": 1
+    },
+    {
+      "outcome": "insufficient_evidence",
+      "reason": "specialty_not_in_taxonomy: ['Placenta encapsulation']",
+      "count": 1
+    },
+    {
+      "outcome": "insufficient_evidence",
+      "reason": "specialty_not_in_taxonomy: ['Warehousing Support']",
+      "count": 1
+    },
+    {
+      "outcome": "insufficient_evidence",
+      "reason": "specialty_not_in_taxonomy: ['city']",
+      "count": 1
+    },
+    {
+      "outcome": "validation_failed",
+      "reason": "rejected: [('Oracle Database Administration', 'value_not_in_source')]",
+      "count": 1
+    }
+  ],
+  "stage_timings": {
+    "db_read": {
+      "count": 12,
+      "total_s": 42.71,
+      "mean_s": 3.559,
+      "p50_s": 3.674,
+      "p95_s": 8.507
+    },
+    "deterministic": {
+      "count": 12,
+      "total_s": 0.26,
+      "mean_s": 0.021,
+      "p50_s": 0.017,
+      "p95_s": 0.057
+    },
+    "download": {
+      "count": 12,
+      "total_s": 21.7,
+      "mean_s": 1.808,
+      "p50_s": 1.703,
+      "p95_s": 3.77
+    },
+    "extract": {
+      "count": 12,
+      "total_s": 31.98,
+      "mean_s": 2.665,
+      "p50_s": 0.379,
+      "p95_s": 22.461
+    },
+    "ocr": {
+      "count": 3,
+      "total_s": 28.51,
+      "mean_s": 9.505,
+      "p50_s": 4.045,
+      "p95_s": 21.178
+    },
+    "qwen": {
+      "count": 11,
+      "total_s": 490.76,
+      "mean_s": 44.615,
+      "p50_s": 28.307,
+      "p95_s": 124.137
+    },
+    "validate": {
+      "count": 12,
+      "total_s": 0.26,
+      "mean_s": 0.022,
+      "p50_s": 0.021,
+      "p95_s": 0.053
+    }
+  },
+  "throughput_all_invocations": {
+    "tasks": 9,
+    "span_s": 367.0,
+    "per_minute": 1.47
+  },
+  "exit_status": 0,
+  "this_invocation": {
+    "id": "3b643edee1",
+    "totals": {
+      "validation_failed": 1,
+      "insufficient_evidence": 8,
+      "prepared": 3
+    },
+    "throughput": {
+      "tasks": 9,
+      "span_s": 367.0,
+      "per_minute": 1.47
+    }
+  }
+}

@@ -193,6 +193,25 @@ def _is_null_token(value: str) -> bool:
 # source grounding
 # ---------------------------------------------------------------------------
 
+def _contains_phrase(lowered_source: str, phrase: str) -> bool:
+    words = re.findall(r"[a-z0-9]+", phrase)
+    if not words:
+        return False
+    pattern = r"(?<![a-z0-9])" + r"[^a-z0-9]+".join(re.escape(w) for w in words) + r"(?![a-z0-9])"
+    return re.search(pattern, lowered_source) is not None
+
+
+def _equivalent_in_source(value: str, source_text: str) -> bool:
+    """True when a reviewed alias/vocabulary phrase that maps to the same label as `value` is in the text."""
+    from profile_enrichment.specialty_lexicon import SpecialtyLexicon
+
+    lexicon = SpecialtyLexicon.load()
+    mapped = lexicon.normalize_label(value)
+    if not mapped:
+        return False
+    return any(match.label == mapped[0] for match in lexicon.find(source_text))
+
+
 def _is_grounded(field: str, value: str, source_text: str) -> bool:
     """True when the value can actually be found in the document text."""
     if not source_text:
@@ -216,10 +235,12 @@ def _is_grounded(field: str, value: str, source_text: str) -> bool:
         return _state_from_text(source_text) == value.upper()
 
     if field == "specialty":
-        # Accept when the distinctive part of the specialty appears in the text,
-        # e.g. "Cardiology" grounded by "cardiology", "Emergency" by "emergency".
-        tokens = re.findall(r"[a-z]{4,}", value.lower())
-        return bool(tokens) and any(token[:6] in lowered for token in tokens)
+        # The phrase itself must be in the text, or a reviewed equivalent of it (alias/abbreviation of a known
+        # label) must be. A shared 6-letter word prefix is not evidence: "Inspect" is not a specialty because
+        # "inspection" appears in a job description.
+        if _contains_phrase(lowered, value.lower()):
+            return True
+        return _equivalent_in_source(value, source_text)
 
     # names and cities must appear verbatim
     return re.search(r"\b" + re.escape(value.lower()) + r"\b", lowered) is not None
@@ -309,7 +330,18 @@ _SPECIALTY_STOPWORDS = {
 }
 
 
+# Credentials, degrees, trainings and tools are not specialties, whatever the model says.
+_SPECIALTY_NON_VALUES = {
+    "bls", "acls", "pals", "cpr", "nrp", "tncc", "hipaa", "epic", "cerner", "meditech", "ms office",
+    "microsoft office", "bsn", "msn", "dnp", "bs", "ba", "ms", "ma", "mba", "phd", "associate degree",
+    "bachelor of science", "master of science", "license", "licensed", "certified", "certification",
+    "board certified", "cad", "sql", "python", "java", "excel", "word", "inspect",
+}
+
+
 def _check_specialty(value: str) -> Optional[str]:
+    if value.lower().strip(". ") in _SPECIALTY_NON_VALUES:
+        return "specialty_is_credential_degree_or_skill"
     if len(value) < 3 or len(value) > 80:
         return "specialty_length_out_of_range"
     if any(ch.isdigit() for ch in value):
@@ -338,9 +370,24 @@ _FIELD_CHECKS = {
 def canonicalize(field: str, value: str) -> str:
     if field in {"state", "state_code"}:
         return value.upper()
-    if field == "email":
-        return value.lower()
     return value
+
+
+_DB_PLACEHOLDERS = {"unknown", "candidate", "unknown candidate", "n/a", "na", "none", "null", "-", "--", "tbd"}
+
+
+def is_blank_or_placeholder(field: str, value: Any) -> bool:
+    """True for a stored value that carries no information (NULL, '', 'Unknown', 'Candidate', ...).
+
+    Only unambiguous no-information tokens count. A populated-but-wrong value such as "Class Of" is NOT
+    blank: replacing it is a correction and belongs in the review workflow.
+    """
+    text = normalize(value)
+    if not text:
+        return True
+    if field in {"first_name", "last_name", "city", "specialty", "state_code", "email"}:
+        return text.lower().strip(".") in _DB_PLACEHOLDERS
+    return False
 
 
 def validate_field(

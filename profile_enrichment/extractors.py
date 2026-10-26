@@ -1,21 +1,42 @@
+"""Document -> per-page text (native text and OCR) and cheap regex candidates for profile fields.
+
+Page-level decisions
+--------------------
+Every page is judged on its own: a PDF page with a text layer is used as is, a page without one (or with a
+garbled one) is rendered and OCR'd, so mixed native/scanned PDFs work. A DOCX that is only pictures is
+OCR'd image by image. A page whose OCR could not be completed (engine down, output cut off by the token
+limit) is reported as *incomplete* instead of silently becoming empty text, so the caller can retry it
+rather than conclude that the resume says nothing.
+
+OCR engines
+-----------
+Qwen vision first, Tesseract second. Each sits behind a circuit breaker: after N consecutive failures the
+engine is skipped for a cooldown and then probed again, so one transient error no longer switches OCR off
+for the rest of a multi-day run.
+"""
+
 from __future__ import annotations
 
 import base64
+import hashlib
 import io
-import json
 import logging
 import os
 import re
 import threading
+import time
 import zipfile
-from functools import lru_cache
-from typing import Any, Dict, List, Optional
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional, Tuple
 
 from PIL import Image
 
 from profile_enrichment.config import CONFIG
 
 logger = logging.getLogger(__name__)
+
+EXTRACTOR_VERSION = "2026-10-26.v2"
+_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp"}
 
 
 def normalize_text(value: Optional[str]) -> str:
@@ -24,526 +45,648 @@ def normalize_text(value: Optional[str]) -> str:
     return " ".join(str(value).strip().split())
 
 
-_TESSERACT_UNAVAILABLE_REASON: Optional[str] = None
-_VISION_UNAVAILABLE_REASON: Optional[str] = None
-
-
-def _resolve_tesseract_cmd(configured: str) -> str:
-    """Accept either the tesseract executable or the folder that contains it.
-
-    Pointing TESSERACT_CMD at the install directory is an easy mistake and fails
-    with a bare "[WinError 5] Access is denied", so resolve it here instead.
-    """
-    if not configured:
-        return ""
-    if os.path.isdir(configured):
-        for candidate in ("tesseract.exe", "tesseract"):
-            path = os.path.join(configured, candidate)
-            if os.path.isfile(path):
-                return path
-    return configured
-
-
-def _configure_tesseract() -> None:
-    import pytesseract
-
-    resolved = _resolve_tesseract_cmd(CONFIG["tesseract_cmd"])
-    if resolved:
-        pytesseract.pytesseract.tesseract_cmd = resolved
-
-
-def _disable_tesseract(reason: str) -> None:
-    """Remember that Tesseract is unusable so we stop retrying it for every page."""
-    global _TESSERACT_UNAVAILABLE_REASON
-    if _TESSERACT_UNAVAILABLE_REASON is None:
-        _TESSERACT_UNAVAILABLE_REASON = reason
-        logger.warning("TESSERACT_DISABLED | reason=%s", reason)
-
-
-def _disable_vision_ocr(reason: str) -> None:
-    """Remember that the Qwen vision endpoint is unusable for the rest of the run."""
-    global _VISION_UNAVAILABLE_REASON
-    if _VISION_UNAVAILABLE_REASON is None:
-        _VISION_UNAVAILABLE_REASON = reason
-        logger.warning("VISION_OCR_DISABLED | reason=%s", reason)
-
-
-def _vision_ocr_base_url() -> Optional[str]:
-    return CONFIG["vision_ocr_base_url"] or CONFIG["local_model_base_url"]
-
-
-@lru_cache(maxsize=4)
-def _get_openai_client(base_url: str, api_key: str, timeout: float):
-    from openai import OpenAI
-
-    return OpenAI(base_url=base_url.rstrip("/") + "/", api_key=api_key, timeout=timeout)
-
-
-def _image_to_data_uri(image: Image.Image) -> str:
-    rgb_image = image.convert("RGB")
-    max_side = CONFIG["vision_ocr_max_image_side"]
-    if max_side and max(rgb_image.size) > max_side:
-        ratio = max_side / max(rgb_image.size)
-        new_size = (max(1, int(rgb_image.width * ratio)), max(1, int(rgb_image.height * ratio)))
-        rgb_image = rgb_image.resize(new_size)
-
-    buffer = io.BytesIO()
-    rgb_image.save(buffer, format="PNG", optimize=True)
-    return "data:image/png;base64," + base64.b64encode(buffer.getvalue()).decode("ascii")
-
-
-def _qwen_vision_ocr(image: Image.Image) -> str:
-    """Transcribe an image with the Qwen vision model. Returns "" when unavailable."""
-    if not CONFIG["vision_ocr_enabled"] or _VISION_UNAVAILABLE_REASON is not None:
-        return ""
-
-    base_url = _vision_ocr_base_url()
-    if not base_url:
-        _disable_vision_ocr("no VISION_OCR_BASE_URL / LOCAL_MODEL_BASE_URL configured")
-        return ""
-
-    try:
-        client = _get_openai_client(
-            base_url=base_url,
-            api_key=CONFIG["vision_ocr_api_key"] or CONFIG["local_model_api_key"] or "local-qwen",
-            timeout=CONFIG["vision_ocr_timeout"],
-        )
-        response = client.chat.completions.create(
-            model=CONFIG["vision_ocr_model"],
-            messages=[
-                {
-                    "role": "system",
-                    "content": "You are an OCR engine. Transcribe the page verbatim as plain text. No commentary.",
-                },
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "text",
-                            "text": (
-                                "Transcribe every piece of text in this resume page, preserving reading order. "
-                                "Include names, phone numbers, emails, addresses and headings. "
-                                "If the page has no text, reply with an empty response."
-                            ),
-                        },
-                        {"type": "image_url", "image_url": {"url": _image_to_data_uri(image)}},
-                    ],
-                },
-            ],
-            temperature=0,
-            max_tokens=CONFIG["vision_ocr_max_tokens"],
-        )
-    except Exception as exc:
-        _disable_vision_ocr(f"{type(exc).__name__}: {exc}")
-        return ""
-
-    return response.choices[0].message.content or ""
-
-
-def _tesseract_ocr(image: Image.Image) -> str:
-    if not CONFIG["ocr_enabled"] or _TESSERACT_UNAVAILABLE_REASON is not None:
-        return ""
-
-    try:
-        import pytesseract
-
-        _configure_tesseract()
-        return pytesseract.image_to_string(image.convert("RGB"))
-    except (PermissionError, FileNotFoundError, OSError) as exc:
-        _disable_tesseract(f"tesseract not runnable ({exc})")
-        return ""
-    except Exception as exc:
-        if "TesseractNotFound" in type(exc).__name__:
-            _disable_tesseract("tesseract binary not found")
-        else:
-            logger.debug("TESSERACT_PAGE_SKIPPED | %s: %s", type(exc).__name__, exc)
-        return ""
-
-
-def _needs_ocr(native_text: str) -> bool:
-    """Skip OCR when the document already yielded enough native text."""
-    if not CONFIG["ocr_skip_when_native_text"]:
-        return True
-    return not has_meaningful_text(native_text)
-
-
-def _ocr_is_available() -> bool:
-    vision_possible = (
-        CONFIG["vision_ocr_enabled"] and _VISION_UNAVAILABLE_REASON is None and bool(_vision_ocr_base_url())
-    )
-    tesseract_possible = CONFIG["ocr_enabled"] and _TESSERACT_UNAVAILABLE_REASON is None
-    return vision_possible or tesseract_possible
-
-
-def _safe_ocr(func, *args) -> str:
-    """Run an OCR helper, degrading to empty text instead of raising."""
-    if not _ocr_is_available():
-        return ""
-    try:
-        return func(*args)
-    except Exception as exc:
-        logger.debug("OCR_SKIPPED | %s: %s", type(exc).__name__, exc)
-        return ""
-
-
 def has_meaningful_text(text: Optional[str], minimum_chars: Optional[int] = None) -> bool:
     content = normalize_text(text)
     alnum_chars = sum(1 for ch in content if ch.isalnum())
     return alnum_chars >= (minimum_chars or CONFIG["ocr_min_text_chars"])
 
 
-def parse_pdf_text(path: str) -> str:
-    from pypdf import PdfReader
+def _alnum_count(text: str) -> int:
+    return sum(1 for ch in text if ch.isalnum())
 
-    try:
-        reader = PdfReader(path)
-        pages = []
-        for page in reader.pages:
-            try:
-                text = page.extract_text() or ""
-                pages.append(text)
-            except Exception as e:
-                logger.debug(f"Failed to extract text from PDF page: {e}")
-        return "\n".join(pages)
-    except Exception as e:
-        logger.debug(f"Failed to read PDF file: {e}")
+
+def _looks_garbled(text: str) -> bool:
+    """A text layer that is mostly replacement characters / CID placeholders is not usable text."""
+    if not text.strip():
+        return False
+    bad = text.count("\ufffd") + 5 * text.count("(cid:")
+    visible = sum(1 for ch in text if not ch.isspace())
+    return visible > 0 and (bad / visible > 0.2 or _alnum_count(text) / visible < 0.3)
+
+
+# ---------------------------------------------------------------------------------------------
+# document model
+# ---------------------------------------------------------------------------------------------
+
+@dataclass
+class PageText:
+    number: int
+    text: str = ""
+    source: str = "native"  # native | ocr_vision | ocr_tesseract | none
+    ocr_attempted: bool = False
+    ocr_complete: bool = True
+    error: str = ""
+
+
+@dataclass
+class DocumentContent:
+    pages: List[PageText] = field(default_factory=list)
+    extension: str = ""
+    sha256: str = ""
+    problems: List[str] = field(default_factory=list)  # whole-document problems (corrupt, encrypted, ...)
+
+    @property
+    def text(self) -> str:
+        return "\n\n".join(p.text for p in self.pages if p.text.strip())
+
+    @property
+    def page_texts(self) -> List[Tuple[int, str]]:
+        return [(p.number, p.text) for p in self.pages if p.text.strip()]
+
+    @property
+    def ocr_complete(self) -> bool:
+        return all(p.ocr_complete for p in self.pages)
+
+    @property
+    def incomplete_pages(self) -> List[int]:
+        return [p.number for p in self.pages if not p.ocr_complete]
+
+    @property
+    def native_text(self) -> str:
+        return "\n\n".join(p.text for p in self.pages if p.source == "native" and p.text.strip())
+
+    @property
+    def ocr_text(self) -> str:
+        return "\n\n".join(p.text for p in self.pages if p.source.startswith("ocr") and p.text.strip())
+
+    def failure_reason(self) -> str:
+        """Why this document cannot be trusted as the complete resume ('' when it can)."""
+        if self.problems:
+            return "; ".join(self.problems)
+        if not self.ocr_complete:
+            details = "; ".join(f"page {p.number}: {p.error or 'ocr incomplete'}" for p in self.pages if not p.ocr_complete)
+            return f"ocr_incomplete ({details})"
         return ""
 
 
-def parse_pdf_bytes(data: bytes) -> str:
+# ---------------------------------------------------------------------------------------------
+# circuit breaker + OCR engines
+# ---------------------------------------------------------------------------------------------
+
+class CircuitBreaker:
+    """closed -> (N consecutive failures) -> open for `cooldown` seconds -> half-open (one probe) -> closed."""
+
+    def __init__(self, name: str, threshold: int, cooldown: float, clock=time.monotonic):
+        self.name, self.threshold, self.cooldown, self._clock = name, threshold, cooldown, clock
+        self._lock = threading.Lock()
+        self._failures = 0
+        self._opened_at: Optional[float] = None
+        self._probing = False
+        self.last_error = ""
+
+    def allow(self) -> bool:
+        with self._lock:
+            if self._opened_at is None:
+                return True
+            if self._clock() - self._opened_at >= self.cooldown and not self._probing:
+                self._probing = True  # exactly one caller probes the engine again
+                return True
+            return False
+
+    def success(self) -> None:
+        with self._lock:
+            if self._opened_at is not None:
+                logger.info("OCR_ENGINE_RECOVERED | engine=%s", self.name)
+            self._failures, self._opened_at, self._probing = 0, None, False
+
+    def failure(self, reason: str) -> None:
+        with self._lock:
+            self._failures += 1
+            self.last_error = reason
+            if self._probing or self._failures >= self.threshold:
+                if self._opened_at is None or self._probing:
+                    logger.warning("OCR_ENGINE_PAUSED | engine=%s | cooldown=%ss | reason=%s", self.name, self.cooldown, reason)
+                self._opened_at, self._probing = self._clock(), False
+
+    @property
+    def is_open(self) -> bool:
+        with self._lock:
+            return self._opened_at is not None
+
+
+_BREAKERS: Dict[str, CircuitBreaker] = {}
+_BREAKER_LOCK = threading.Lock()
+
+
+def breaker(name: str) -> CircuitBreaker:
+    with _BREAKER_LOCK:
+        if name not in _BREAKERS:
+            _BREAKERS[name] = CircuitBreaker(name, CONFIG["vision_ocr_failure_threshold"], CONFIG["vision_ocr_cooldown"])
+        return _BREAKERS[name]
+
+
+def reset_breakers() -> None:
+    with _BREAKER_LOCK:
+        _BREAKERS.clear()
+
+
+@dataclass
+class OcrOutcome:
+    text: str = ""
+    complete: bool = False
+    engine: str = ""
+    error: str = ""
+
+
+def _vision_base_url() -> Optional[str]:
+    return CONFIG["vision_ocr_base_url"] or CONFIG["local_model_base_url"]
+
+
+def _vision_configured() -> bool:
+    return bool(CONFIG["vision_ocr_enabled"] and _vision_base_url() and CONFIG["vision_ocr_model"])
+
+
+def _tesseract_configured() -> bool:
+    return bool(CONFIG["ocr_enabled"])
+
+
+def _resolve_tesseract_cmd(configured: str) -> str:
+    """Accept either the tesseract executable or the folder that contains it."""
+    if configured and os.path.isdir(configured):
+        for candidate in ("tesseract.exe", "tesseract"):
+            path = os.path.join(configured, candidate)
+            if os.path.isfile(path):
+                return path
+    return configured or ""
+
+
+def _image_to_data_uri(image: Image.Image) -> str:
+    rgb = image.convert("RGB")
+    max_side = CONFIG["vision_ocr_max_image_side"]
+    if max_side and max(rgb.size) > max_side:
+        ratio = max_side / max(rgb.size)
+        rgb = rgb.resize((max(1, int(rgb.width * ratio)), max(1, int(rgb.height * ratio))))
+    buffer = io.BytesIO()
+    rgb.save(buffer, format="PNG", optimize=True)
+    return "data:image/png;base64," + base64.b64encode(buffer.getvalue()).decode("ascii")
+
+
+def _vision_call(image: Image.Image) -> Tuple[str, str]:
+    """One vision request -> (text, finish_reason). Raises on transport errors."""
+    from profile_enrichment.inference import _get_openai_client
+
+    client = _get_openai_client(
+        _vision_base_url(), CONFIG["vision_ocr_api_key"] or CONFIG["local_model_api_key"] or "local-qwen",
+        CONFIG["vision_ocr_timeout"],
+    )
+    response = client.chat.completions.create(
+        model=CONFIG["vision_ocr_model"],
+        messages=[
+            {"role": "system", "content": "You are an OCR engine. Transcribe the page verbatim as plain text. No commentary."},
+            {"role": "user", "content": [
+                {"type": "text", "text": (
+                    "Transcribe every piece of text in this resume page, preserving reading order. Include names, "
+                    "phone numbers, emails, addresses and headings. If the page has no text, reply with an empty response.")},
+                {"type": "image_url", "image_url": {"url": _image_to_data_uri(image)}},
+            ]},
+        ],
+        temperature=0,
+        max_tokens=CONFIG["vision_ocr_max_tokens"],
+    )
+    choice = response.choices[0]
+    return choice.message.content or "", choice.finish_reason or "stop"
+
+
+def _vision_ocr(image: Image.Image, depth: int = 0) -> OcrOutcome:
+    """Vision OCR with retries. Output cut off by the token limit is not accepted: the page is split and re-read."""
+    last_error = ""
+    for attempt in (1, 2):
+        try:
+            text, finish = _vision_call(image)
+        except Exception as exc:  # noqa: BLE001
+            last_error = f"{type(exc).__name__}: {exc}"
+            if "not found" in last_error.lower() or "NotFoundError" in last_error:
+                break  # a missing model will not appear on a retry
+            time.sleep(0.5 * attempt)
+            continue
+        if finish == "length":
+            if depth >= 1 or image.height < 200:
+                return OcrOutcome(text, False, "vision", "ocr output truncated at max_tokens")
+            half = image.height // 2
+            top = _vision_ocr(image.crop((0, 0, image.width, min(image.height, half + 40))), depth + 1)
+            bottom = _vision_ocr(image.crop((0, max(0, half - 40), image.width, image.height)), depth + 1)
+            return OcrOutcome(f"{top.text}\n{bottom.text}".strip(), top.complete and bottom.complete, "vision",
+                              top.error or bottom.error)
+        return OcrOutcome(text, True, "vision")
+    return OcrOutcome("", False, "vision", last_error)
+
+
+def _tesseract_ocr(image: Image.Image) -> OcrOutcome:
+    try:
+        import pytesseract
+
+        resolved = _resolve_tesseract_cmd(CONFIG["tesseract_cmd"])
+        if resolved:
+            pytesseract.pytesseract.tesseract_cmd = resolved
+        return OcrOutcome(pytesseract.image_to_string(image.convert("RGB"), timeout=90), True, "tesseract")
+    except Exception as exc:  # noqa: BLE001
+        return OcrOutcome("", False, "tesseract", f"{type(exc).__name__}: {exc}")
+
+
+_ocr_clock = threading.local()
+
+
+def consume_ocr_seconds() -> float:
+    """Seconds this thread spent in OCR since the last call (lets the pipeline time OCR apart from parsing)."""
+    seconds = getattr(_ocr_clock, "seconds", 0.0)
+    _ocr_clock.seconds = 0.0
+    return seconds
+
+
+def ocr_image(image: Image.Image) -> OcrOutcome:
+    """OCR one page image through the first engine whose breaker allows it. Never raises."""
+    started = time.monotonic()
+    try:
+        return _ocr_image(image)
+    finally:
+        _ocr_clock.seconds = getattr(_ocr_clock, "seconds", 0.0) + time.monotonic() - started
+
+
+def _ocr_image(image: Image.Image) -> OcrOutcome:
+    errors: List[str] = []
+    for name, configured, run in (("vision", _vision_configured(), _vision_ocr), ("tesseract", _tesseract_configured(), _tesseract_ocr)):
+        if not configured:
+            continue
+        gate = breaker(name)
+        if not gate.allow():
+            errors.append(f"{name}: paused ({gate.last_error})")
+            continue
+        outcome = run(image)
+        if outcome.complete:
+            gate.success()
+            return outcome
+        gate.failure(outcome.error or "incomplete output")
+        errors.append(f"{name}: {outcome.error}")
+    return OcrOutcome("", False, "", "; ".join(errors) or "no OCR engine configured")
+
+
+def ocr_engine_status() -> Dict[str, str]:
+    status = {}
+    status["vision"] = ("not configured" if not _vision_configured()
+                        else ("paused: " + breaker("vision").last_error) if breaker("vision").is_open else "active")
+    status["tesseract"] = ("not configured" if not _tesseract_configured()
+                           else ("paused: " + breaker("tesseract").last_error) if breaker("tesseract").is_open else "active")
+    return status
+
+
+def check_vision_ready() -> Tuple[bool, str]:
+    """Prove the *vision* model can read: OCR a rendered line of text and compare. Independent of the text model."""
+    if not _vision_configured():
+        return False, "vision OCR not configured (set VISION_OCR_BASE_URL / VISION_OCR_MODEL)"
+    from PIL import ImageDraw, ImageFont
+
+    image = Image.new("RGB", (900, 160), "white")
+    try:
+        font = ImageFont.load_default(size=48)
+    except TypeError:  # very old Pillow
+        font = ImageFont.load_default()
+    ImageDraw.Draw(image).text((20, 50), "Cardiology 4827", fill="black", font=font)
+    outcome = _vision_ocr(image)
+    if not outcome.complete:
+        return False, f"vision model call failed: {outcome.error}"
+    if "4827" not in outcome.text.replace(" ", ""):
+        return False, f"vision model answered but did not read the test image (got {outcome.text[:60]!r})"
+    return True, f"vision model {CONFIG['vision_ocr_model']} read the test image"
+
+
+def check_tesseract_ready() -> Tuple[bool, str]:
+    if not _tesseract_configured():
+        return False, "OCR_ENABLED is false"
+    image = Image.new("RGB", (600, 120), "white")
+    from PIL import ImageDraw, ImageFont
+
+    try:
+        font = ImageFont.load_default(size=48)
+    except TypeError:
+        font = ImageFont.load_default()
+    ImageDraw.Draw(image).text((10, 30), "Nurse 7351", fill="black", font=font)
+    outcome = _tesseract_ocr(image)
+    if not outcome.complete:
+        return False, outcome.error
+    return ("7351" in outcome.text.replace(" ", "")), f"tesseract returned {outcome.text.strip()[:40]!r}"
+
+
+# ---------------------------------------------------------------------------------------------
+# parsers
+# ---------------------------------------------------------------------------------------------
+
+def _ocr_page(page: PageText, image: Image.Image) -> None:
+    page.ocr_attempted = True
+    outcome = ocr_image(image)
+    page.ocr_complete = outcome.complete
+    page.error = outcome.error
+    if outcome.complete:
+        page.text = outcome.text
+        page.source = "ocr_vision" if outcome.engine == "vision" else "ocr_tesseract"
+    elif not page.text.strip():
+        page.source = "none"
+
+
+def _page_needs_ocr(native: str) -> bool:
+    if not CONFIG["ocr_skip_when_native_text"]:
+        return True
+    return _alnum_count(native) < CONFIG["ocr_min_page_chars"] or _looks_garbled(native)
+
+
+def _parse_pdf(data: bytes, ocr_enabled: bool) -> DocumentContent:
     from pypdf import PdfReader
 
+    doc = DocumentContent(extension=".pdf")
     try:
         reader = PdfReader(io.BytesIO(data))
-        pages = []
+        if reader.is_encrypted and not reader.decrypt(""):
+            doc.problems.append("pdf_encrypted")
+            return doc
+        natives = []
         for page in reader.pages:
             try:
-                text = page.extract_text() or ""
-                pages.append(text)
-            except Exception as e:
-                logger.debug(f"Failed to extract text from PDF page: {e}")
-        return "\n".join(pages)
-    except Exception as e:
-        logger.debug(f"Failed to read PDF file: {e}")
-        return ""
+                natives.append(page.extract_text() or "")
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("pdf page text extraction failed: %s", exc)
+                natives.append("")
+    except Exception as exc:  # noqa: BLE001
+        doc.problems.append(f"pdf_unreadable: {type(exc).__name__}: {exc}")
+        return doc
 
-
-def parse_docx_text(path: str) -> str:
-    from docx import Document
-
+    doc.pages = [PageText(number=i + 1, text=text) for i, text in enumerate(natives)]
+    needing = [p for p in doc.pages if _page_needs_ocr(p.text)]
+    if not needing:
+        return doc
+    if not ocr_enabled:
+        # OCR was switched off on purpose: report what we have, do not claim the document was read in full.
+        for page in needing:
+            if not page.text.strip():
+                page.ocr_complete = False
+                page.error = "page has no text layer and OCR is disabled"
+                page.source = "none"
+        return doc
     try:
-        doc = Document(path)
-        chunks: List[str] = []
-        chunks.extend(p.text for p in doc.paragraphs if p.text.strip())
-        for table in doc.tables:
-            for row in table.rows:
-                values = [cell.text.strip() for cell in row.cells if cell.text.strip()]
-                if values:
-                    chunks.append(" | ".join(values))
-        return "\n".join(chunks)
-    except Exception as e:
-        logger.debug(f"Failed to read DOCX file: {e}")
-        return ""
+        import pypdfium2 as pdfium
 
-
-def parse_docx_bytes(data: bytes) -> str:
-    from docx import Document
-
+        pdf = pdfium.PdfDocument(io.BytesIO(data))
+    except Exception as exc:  # noqa: BLE001
+        for page in needing:
+            page.ocr_complete, page.error = False, f"cannot render page for OCR: {type(exc).__name__}: {exc}"
+        return doc
     try:
-        doc = Document(io.BytesIO(data))
-        chunks: List[str] = []
-        chunks.extend(p.text for p in doc.paragraphs if p.text.strip())
-        for table in doc.tables:
-            for row in table.rows:
-                values = [cell.text.strip() for cell in row.cells if cell.text.strip()]
-                if values:
-                    chunks.append(" | ".join(values))
-        return "\n".join(chunks)
-    except Exception as e:
-        logger.debug(f"Failed to read DOCX file: {e}")
-        return ""
-
-
-def _read_text_file(path: str) -> str:
-    with open(path, "r", encoding="utf-8", errors="ignore") as fh:
-        return fh.read()
-
-
-def _ocr_pil_image(image: Image.Image) -> str:
-    """OCR one page image: Qwen vision model first, Tesseract as the fallback."""
-    text = _qwen_vision_ocr(image)
-    if normalize_text(text):
-        return text
-    return _tesseract_ocr(image)
-
-
-def _ocr_image_file(path: str) -> str:
-    with Image.open(path) as image:
-        return _ocr_pil_image(image)
-
-
-def _ocr_pdf_pages(path: str) -> str:
-    import pypdfium2 as pdfium
-
-    pdf = pdfium.PdfDocument(path)
-    segments: List[str] = []
-    try:
-        for page in pdf:
-            bitmap = page.render(scale=2)
-            image = bitmap.to_pil()
-            text = _ocr_pil_image(image)
-            if text.strip():
-                segments.append(text)
-    finally:
-        pdf.close()
-    return "\n".join(segments)
-
-
-def _ocr_pdf_pages_bytes(data: bytes) -> str:
-    import pypdfium2 as pdfium
-
-    pdf = pdfium.PdfDocument(io.BytesIO(data))
-    segments: List[str] = []
-    try:
-        for page in pdf:
-            bitmap = page.render(scale=2)
-            image = bitmap.to_pil()
-            text = _ocr_pil_image(image)
-            if text.strip():
-                segments.append(text)
-    finally:
-        pdf.close()
-    return "\n".join(segments)
-
-
-def _ocr_docx_embedded_images(path: str) -> str:
-    from PIL import Image
-
-    segments: List[str] = []
-    with zipfile.ZipFile(path) as archive:
-        for name in archive.namelist():
-            if not name.startswith("word/media/"):
+        for page in needing:
+            try:
+                image = pdf[page.number - 1].render(scale=2).to_pil()
+            except Exception as exc:  # noqa: BLE001
+                page.ocr_complete, page.error = False, f"render failed: {type(exc).__name__}: {exc}"
                 continue
-            with archive.open(name) as handle:
-                raw = handle.read()
-            with Image.open(io.BytesIO(raw)) as image:
-                text = _ocr_pil_image(image)
-                if text.strip():
-                    segments.append(text)
-    return "\n".join(segments)
+            native = page.text
+            _ocr_page(page, image)
+            if not page.ocr_complete and native.strip():
+                page.text, page.source, page.ocr_complete = native, "native", True  # garbled-but-present beats nothing
+    finally:
+        pdf.close()
+    return doc
 
 
-def _ocr_docx_embedded_images_bytes(data: bytes) -> str:
-    segments: List[str] = []
+_W_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+
+
+def _docx_paragraph_pages(data: bytes) -> List[str]:
+    """Text of every paragraph in document order (body, tables, text boxes, headers/footers), split on page breaks."""
+    from docx import Document
+    from docx.oxml.ns import qn
+
+    document = Document(io.BytesIO(data))
+    pages: List[List[str]] = [[]]
+    seen_in_textbox: set = set()
+
+    def paragraph_text(p) -> str:
+        return "".join(t.text or "" for t in p.iter(qn("w:t")))
+
+    def has_break(p) -> bool:
+        if any(True for _ in p.iter(qn("w:lastRenderedPageBreak"))):
+            return True
+        return any(br.get(qn("w:type")) == "page" for br in p.iter(qn("w:br")))
+
+    # headers/footers first: names and contact lines often live there
+    header_texts: List[str] = []
+    for section in document.sections:
+        for part in (section.header, section.first_page_header, section.even_page_header,
+                     section.footer, section.first_page_footer, section.even_page_footer):
+            try:
+                for paragraph in part.paragraphs:
+                    text = paragraph.text.strip()
+                    if text and text not in header_texts:
+                        header_texts.append(text)
+            except Exception:  # noqa: BLE001
+                continue
+    pages[0].extend(header_texts)
+
+    for p in document.element.body.iter(qn("w:p")):
+        in_fallback = any(anc.tag.endswith("}Fallback") for anc in p.iterancestors())
+        if in_fallback:
+            continue  # text boxes appear twice (Choice + Fallback)
+        text = paragraph_text(p).strip()
+        in_box = any(anc.tag == qn("w:txbxContent") for anc in p.iterancestors())
+        if text:
+            key = (text, in_box)
+            if in_box and key in seen_in_textbox:
+                continue
+            seen_in_textbox.add(key)
+            in_cell = any(anc.tag == qn("w:tc") for anc in p.iterancestors())
+            pages[-1].append(text if not in_cell else text)
+        if has_break(p):
+            pages.append([])
+    return ["\n".join(lines) for lines in pages if lines]
+
+
+def _docx_images(data: bytes) -> List[Image.Image]:
+    images: List[Image.Image] = []
     with zipfile.ZipFile(io.BytesIO(data)) as archive:
-        for name in archive.namelist():
-            if not name.startswith("word/media/"):
+        names = sorted(n for n in archive.namelist() if n.startswith("word/media/"))
+        for name in names:
+            raw = archive.read(name)
+            if len(raw) < 4000:
+                continue  # bullets, rules, logos
+            try:
+                image = Image.open(io.BytesIO(raw))
+                image.load()
+            except Exception:  # noqa: BLE001 - emf/wmf/svg and other non-raster media
                 continue
-            with archive.open(name) as handle:
-                raw = handle.read()
-            with Image.open(io.BytesIO(raw)) as image:
-                text = _ocr_pil_image(image)
-                if text.strip():
-                    segments.append(text)
-    return "\n".join(segments)
+            if image.width < 150 or image.height < 150:
+                continue
+            images.append(image)
+    return images
 
 
-def extract_text_layers_from_file(path: str) -> Dict[str, str]:
-    ext = os.path.splitext(path.lower())[1]
-    native_text = ""
-    ocr_text = ""
+def _parse_docx(data: bytes, ocr_enabled: bool) -> DocumentContent:
+    doc = DocumentContent(extension=".docx")
+    try:
+        texts = _docx_paragraph_pages(data)
+    except Exception as exc:  # noqa: BLE001
+        doc.problems.append(f"docx_unreadable: {type(exc).__name__}: {exc}")
+        return doc
+    doc.pages = [PageText(number=i + 1, text=t) for i, t in enumerate(texts)]
+    native_chars = sum(_alnum_count(p.text) for p in doc.pages)
+    if native_chars >= CONFIG["ocr_min_text_chars"] and CONFIG["ocr_skip_when_native_text"]:
+        return doc
 
-    if ext == ".pdf":
-        native_text = parse_pdf_text(path)
-        if CONFIG["ocr_enabled"] and _needs_ocr(native_text):
-            ocr_text = _safe_ocr(_ocr_pdf_pages, path)
-    elif ext == ".docx":
-        native_text = parse_docx_text(path)
-        if CONFIG["ocr_enabled"] and _needs_ocr(native_text):
-            ocr_text = _safe_ocr(_ocr_docx_embedded_images, path)
-    elif ext in {".txt", ".rtf"}:
-        native_text = _read_text_file(path)
-    elif ext in {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp"}:
-        if CONFIG["ocr_enabled"]:
-            ocr_text = _safe_ocr(_ocr_image_file, path)
-    else:
-        raise ValueError(f"Unsupported document type: {ext}")
-
-    combined_parts = [segment for segment in (native_text, ocr_text) if normalize_text(segment)]
-    return {
-        "native_text": native_text,
-        "ocr_text": ocr_text,
-        "combined_text": "\n\n".join(combined_parts),
-    }
+    try:
+        images = _docx_images(data)
+    except Exception as exc:  # noqa: BLE001
+        doc.problems.append(f"docx_media_unreadable: {type(exc).__name__}: {exc}")
+        return doc
+    if not images:
+        if native_chars == 0:
+            doc.pages = doc.pages or []
+        return doc
+    if not ocr_enabled:
+        if native_chars == 0:
+            doc.pages.append(PageText(number=1, source="none", ocr_complete=False, error="image-only document and OCR is disabled"))
+        return doc
+    base = len(doc.pages)
+    for offset, image in enumerate(images, start=1):
+        page = PageText(number=base + offset, source="none")
+        _ocr_page(page, image)
+        doc.pages.append(page)
+    return doc
 
 
-def extract_text_layers_from_bytes(data: bytes, file_extension: str, ocr_enabled: bool | None = None) -> Dict[str, str]:
-    """Extract text layers from file bytes without saving to disk."""
+def _rtf_to_text(raw: str) -> str:
+    text = re.sub(r"\\'([0-9a-fA-F]{2})", lambda m: bytes.fromhex(m.group(1)).decode("cp1252", "ignore"), raw)
+    text = re.sub(r"\\(?:par|line)\b", "\n", text)
+    text = re.sub(r"\{\\\*[^{}]*\}", "", text)
+    text = re.sub(r"\\[a-zA-Z]+-?\d* ?", "", text)
+    return re.sub(r"[{}]", "", text)
+
+
+def _parse_image(data: bytes, ocr_enabled: bool) -> DocumentContent:
+    doc = DocumentContent(extension=".img")
+    try:
+        image = Image.open(io.BytesIO(data))
+        frames = []
+        for index in range(getattr(image, "n_frames", 1)):
+            image.seek(index)
+            frames.append(image.copy())
+    except Exception as exc:  # noqa: BLE001
+        doc.problems.append(f"image_unreadable: {type(exc).__name__}: {exc}")
+        return doc
+    for index, frame in enumerate(frames, start=1):
+        page = PageText(number=index, source="none")
+        if ocr_enabled:
+            _ocr_page(page, frame)
+        else:
+            page.ocr_complete, page.error = False, "image-only document and OCR is disabled"
+        doc.pages.append(page)
+    return doc
+
+
+def sniff_extension(data: bytes, file_ref: str = "") -> str:
+    """The document type from its bytes (URLs sometimes lie or have no extension)."""
+    if data[:5] == b"%PDF-":
+        return ".pdf"
+    if data[:2] == b"PK":
+        try:
+            with zipfile.ZipFile(io.BytesIO(data)) as archive:
+                if "word/document.xml" in archive.namelist():
+                    return ".docx"
+        except zipfile.BadZipFile:
+            pass
+    if data[:4] == bytes([0xD0, 0xCF, 0x11, 0xE0]):
+        return ".doc"
+    if data[:5] == b"{" + bytes([0x5C]) + b"rtf":
+        return ".rtf"
+    ext = os.path.splitext(file_ref.split("?")[0].lower())[1]
+    return ext or ".bin"
+
+
+def extract_document(data: bytes, file_extension: str, ocr_enabled: bool | None = None) -> DocumentContent:
+    """Per-page content of a document. Raises ValueError for an unsupported type; never for a bad file."""
     ext = file_extension.lower()
     if not ext.startswith("."):
         ext = f".{ext}"
-
-    ocr_enabled = ocr_enabled if ocr_enabled is not None else CONFIG["ocr_enabled"]
-    native_text = ""
-    ocr_text = ""
-
+    ocr_enabled = CONFIG["ocr_enabled"] if ocr_enabled is None else ocr_enabled
     if ext == ".pdf":
-        native_text = parse_pdf_bytes(data)
-        if ocr_enabled and _needs_ocr(native_text):
-            ocr_text = _safe_ocr(_ocr_pdf_pages_bytes, data)
+        doc = _parse_pdf(data, ocr_enabled)
     elif ext == ".docx":
-        native_text = parse_docx_bytes(data)
-        if ocr_enabled and _needs_ocr(native_text):
-            ocr_text = _safe_ocr(_ocr_docx_embedded_images_bytes, data)
-    elif ext in {".txt", ".rtf"}:
-        native_text = data.decode("utf-8", errors="ignore")
-    elif ext in {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp"}:
-        if ocr_enabled:
-            ocr_text = _safe_ocr(lambda: _ocr_pil_image(Image.open(io.BytesIO(data))))
+        doc = _parse_docx(data, ocr_enabled)
+    elif ext == ".txt":
+        doc = DocumentContent(pages=[PageText(1, data.decode("utf-8", errors="ignore"))])
+    elif ext == ".rtf":
+        doc = DocumentContent(pages=[PageText(1, _rtf_to_text(data.decode("latin-1", errors="ignore")))])
+    elif ext in _IMAGE_EXTENSIONS:
+        doc = _parse_image(data, ocr_enabled)
     else:
         raise ValueError(f"Unsupported document type: {ext}")
+    doc.extension = ext
+    doc.sha256 = hashlib.sha256(data).hexdigest()
+    return doc
 
-    combined_parts = [segment for segment in (native_text, ocr_text) if normalize_text(segment)]
-    return {
-        "native_text": native_text,
-        "ocr_text": ocr_text,
-        "combined_text": "\n\n".join(combined_parts),
-    }
+
+def extract_text_layers_from_bytes(data: bytes, file_extension: str, ocr_enabled: bool | None = None) -> Dict[str, str]:
+    """Back-compatible view of :func:`extract_document` (native/ocr/combined text)."""
+    doc = extract_document(data, file_extension, ocr_enabled)
+    return {"native_text": doc.native_text, "ocr_text": doc.ocr_text, "combined_text": doc.text}
+
+
+def extract_text_layers_from_file(path: str) -> Dict[str, str]:
+    with open(path, "rb") as handle:
+        return extract_text_layers_from_bytes(handle.read(), os.path.splitext(path)[1])
+
+
+# ---------------------------------------------------------------------------------------------
+# regex candidates (cheap, high precision for contact details)
+# ---------------------------------------------------------------------------------------------
+
+_STATES = {
+    "alabama": "AL", "alaska": "AK", "arizona": "AZ", "arkansas": "AR", "california": "CA", "colorado": "CO",
+    "connecticut": "CT", "delaware": "DE", "district of columbia": "DC", "florida": "FL", "georgia": "GA",
+    "hawaii": "HI", "idaho": "ID", "illinois": "IL", "indiana": "IN", "iowa": "IA", "kansas": "KS",
+    "kentucky": "KY", "louisiana": "LA", "maine": "ME", "maryland": "MD", "massachusetts": "MA",
+    "michigan": "MI", "minnesota": "MN", "mississippi": "MS", "missouri": "MO", "montana": "MT",
+    "nebraska": "NE", "nevada": "NV", "new hampshire": "NH", "new jersey": "NJ", "new mexico": "NM",
+    "new york": "NY", "north carolina": "NC", "north dakota": "ND", "ohio": "OH", "oklahoma": "OK",
+    "oregon": "OR", "pennsylvania": "PA", "rhode island": "RI", "south carolina": "SC", "south dakota": "SD",
+    "tennessee": "TN", "texas": "TX", "utah": "UT", "vermont": "VT", "virginia": "VA", "washington": "WA",
+    "west virginia": "WV", "wisconsin": "WI", "wyoming": "WY",
+}
+_STATE_CODES = set(_STATES.values()) | {"PR"}
+HEADER_CHARS = 700  # contact details live at the top; a state name deep in the body is not the candidate's location
 
 
 def _state_from_text(text: str) -> Optional[str]:
     cleaned = normalize_text(text)
     if not cleaned:
         return None
-
     match = re.search(r",\s*([A-Z]{2})(?:\b|$)", cleaned)
-    if match:
-        return match.group(1).upper()
-
-    states = {
-        "alabama": "AL",
-        "alaska": "AK",
-        "arizona": "AZ",
-        "arkansas": "AR",
-        "california": "CA",
-        "colorado": "CO",
-        "connecticut": "CT",
-        "delaware": "DE",
-        "district of columbia": "DC",
-        "florida": "FL",
-        "georgia": "GA",
-        "hawaii": "HI",
-        "idaho": "ID",
-        "illinois": "IL",
-        "indiana": "IN",
-        "iowa": "IA",
-        "kansas": "KS",
-        "kentucky": "KY",
-        "louisiana": "LA",
-        "maine": "ME",
-        "maryland": "MD",
-        "massachusetts": "MA",
-        "michigan": "MI",
-        "minnesota": "MN",
-        "mississippi": "MS",
-        "missouri": "MO",
-        "montana": "MT",
-        "nebraska": "NE",
-        "nevada": "NV",
-        "new hampshire": "NH",
-        "new jersey": "NJ",
-        "new mexico": "NM",
-        "new york": "NY",
-        "north carolina": "NC",
-        "north dakota": "ND",
-        "ohio": "OH",
-        "oklahoma": "OK",
-        "oregon": "OR",
-        "pennsylvania": "PA",
-        "rhode island": "RI",
-        "south carolina": "SC",
-        "south dakota": "SD",
-        "tennessee": "TN",
-        "texas": "TX",
-        "utah": "UT",
-        "vermont": "VT",
-        "virginia": "VA",
-        "washington": "WA",
-        "west virginia": "WV",
-        "wisconsin": "WI",
-        "wyoming": "WY",
-    }
+    if match and match.group(1) in _STATE_CODES:
+        return match.group(1)
     lowered = cleaned.lower()
-    for state_name, code in states.items():
-        if state_name in lowered:
+    for state_name, code in sorted(_STATES.items(), key=lambda kv: -len(kv[0])):
+        if re.search(r"\b" + re.escape(state_name) + r"\b", lowered):
             return code
     return None
 
 
-EXTRACTION_SYSTEM_PROMPT = (
-    "You are a strict information extractor for resumes. You only copy values that "
-    "are literally present in the supplied text. You never guess, never infer, and "
-    "never invent example data. Return only valid JSON, with no markdown formatting."
-)
-
-# Kept deliberately blunt: the model returning null is the cheap outcome, the model
-# inventing a plausible-looking value is the expensive one.
-EXTRACTION_RULES = (
-    "Extract profile fields from the resume text below.\n"
-    "Return ONLY a JSON object with these keys: first_name, last_name, city, "
-    "state_code, specialty, phone, email.\n"
-    "\n"
-    "HARD RULES:\n"
-    "- Copy values verbatim from the text. Every value you return must appear in the text.\n"
-    "- Do NOT guess. Do NOT infer missing information. Do NOT complete partial data.\n"
-    "- Do NOT generate example, sample, placeholder or default values. Never output "
-    "values such as John Doe, johndoe@example.com, 123-456-7890, New York or "
-    "Cardiology unless those exact values appear in the text.\n"
-    "- If a field is not clearly stated in the text, return null for that field.\n"
-    "- Returning null is always better than returning a value you are unsure about.\n"
-    "- first_name / last_name must be the person's own name, not a heading, job title, "
-    "sentence fragment or employer name. If no person's name is clearly shown, return null.\n"
-    "- specialty: the professional or medical specialty exactly as worded in the text.\n"
-    "- state_code: the 2-letter US state abbreviation, only if a state is stated.\n"
-    "- phone / email: only if a real phone number or email address appears in the text.\n"
-    "\n"
-    "RESUME TEXT:\n"
+_EMAIL_RE = re.compile(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}")
+_PHONE_RES = (
+    re.compile(r"(?<!\d)(?:\+?1[\s.\-]*)?\(?([2-9]\d{2})\)?[\s.\-]*([2-9]\d{2})[\s.\-]*(\d{4})(?!\d)"),
 )
 
 
-def _build_extraction_prompt(text: str) -> str:
-    return EXTRACTION_RULES + text[: CONFIG["ai_prompt_max_chars"]]
+def find_emails(text: str) -> List[Tuple[str, int]]:
+    """Every email in the text with its offset, original capitalisation kept."""
+    return [(m.group(0).rstrip(".-"), m.start()) for m in _EMAIL_RE.finditer(text)]
 
 
-def _first_json_object(payload: str) -> Dict[str, Any]:
-    decoder = json.JSONDecoder()
-    for index, char in enumerate(payload):
-        if char != "{":
-            continue
-        try:
-            obj, _ = decoder.raw_decode(payload[index:])
-        except json.JSONDecodeError:
-            continue
-        if isinstance(obj, dict):
-            return obj
-    raise json.JSONDecodeError("No JSON object found", payload, 0)
+def find_phones(text: str) -> List[Tuple[str, int]]:
+    """Every US-style phone number with its offset (year ranges such as 2020-2024 never match)."""
+    found: List[Tuple[str, int]] = []
+    for pattern in _PHONE_RES:
+        for m in pattern.finditer(text):
+            found.append((normalize_text(m.group(0)), m.start()))
+    return sorted(found, key=lambda item: item[1])
 
 
 def _extract_phone(text: str) -> Optional[str]:
-    """Extract phone number, filtering out year ranges like 2020-2024."""
-    patterns = [
-        r"\+1?\s*\(?([0-9]{3})\)?\s*[-.\s]?([0-9]{3})[-.\s]?([0-9]{4})",
-        r"\+1?\s*([0-9]{3})\s+([0-9]{3})\s+([0-9]{4})",
-        r"(?<!\d)\(?([0-9]{3})\)?\s*[-.]?\s*([0-9]{3})[-.]([0-9]{4})(?!\d)",
-    ]
-
-    for pattern in patterns:
-        match = re.search(pattern, text)
-        if match:
-            phone = "".join(re.findall(r"\d", match.group(0)))
-            if len(phone) >= 10:
-                return normalize_text(match.group(0))
-    return None
+    phones = find_phones(text)
+    return phones[0][0] if phones else None
 
 
 def extract_profile_fields_from_text(text: str) -> Dict[str, Any]:
@@ -552,42 +695,40 @@ def extract_profile_fields_from_text(text: str) -> Dict[str, Any]:
 
     def safe_get(pattern: str, flags: int = 0, group: int = 1) -> Optional[str]:
         match = re.search(pattern, cleaned, flags=flags)
-        if not match:
-            return None
-        return normalize_text(match.group(group))
+        return normalize_text(match.group(group)) if match else None
 
-    email = safe_get(r"\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b", re.IGNORECASE, group=0)
-    if email:
-        extracted["email"] = email
-
+    emails = find_emails(cleaned)
+    if emails:
+        extracted["email"] = emails[0][0]
     phone = _extract_phone(cleaned)
     if phone:
         extracted["phone"] = phone
 
     name_match = re.search(r"(?im)^\s*([A-Z][A-Za-z'`-]+(?:\s+[A-Z][A-Za-z'`-]+){1,3})\s*$", cleaned)
     if name_match:
-        full_name = name_match.group(1).strip()
-        name_parts = full_name.split()
+        name_parts = name_match.group(1).strip().split()
         if len(name_parts) >= 2:
             extracted["first_name"] = name_parts[0]
             extracted["last_name"] = name_parts[-1]
 
-    # The label must be a whole word followed by a real separator and must stop at the
-    # end of the line - an optional separator let "Profession" match inside
-    # "professional" and swallow the rest of the sentence as a value.
     location = safe_get(r"(?im)^\s*(?:Location|Address|Based in)\b\s*[:\-]\s*([A-Za-z0-9 .,'#-]+?)\s*$")
     if location:
         extracted["location"] = location
         if "," in location:
             extracted["city"] = normalize_text(location.split(",", 1)[0])
-
     city = safe_get(r"(?im)^\s*City\b\s*[:\-]\s*([A-Za-z .'-]+?)\s*$")
     if city:
         extracted["city"] = city.split(",", 1)[0].strip()
-        location = extracted.get("location") or city
-        extracted["location"] = location
+        extracted["location"] = extracted.get("location") or city
 
-    state_code = _state_from_text(extracted.get("location") or city or cleaned[:5000])
+    # "City, ST" in the header block (first lines only) - the common resume layout
+    header = cleaned[:HEADER_CHARS]
+    header_loc = re.search(r"(?m)^[^\n@\d]{0,40}?([A-Z][A-Za-z.' -]{1,30}),\s*([A-Z]{2})\b", header)
+    if header_loc and header_loc.group(2) in _STATE_CODES and "city" not in extracted:
+        extracted["city"] = normalize_text(header_loc.group(1))
+        extracted["state_code"] = header_loc.group(2)
+        extracted["state"] = header_loc.group(2)
+    state_code = _state_from_text(extracted.get("location") or city or header)
     if state_code:
         extracted["state_code"] = state_code
         extracted["state"] = state_code
@@ -598,120 +739,36 @@ def extract_profile_fields_from_text(text: str) -> Dict[str, Any]:
     )
     if specialty:
         extracted["specialty"] = specialty
-
     return extracted
 
 
-# Set when the Qwen endpoint call fails, so a caller can tell "the model found nothing"
-# from "the model never answered". Per thread because extraction runs in a worker pool.
-_ai_call_state = threading.local()
+# ---------------------------------------------------------------------------------------------
+# legacy AI entry points (the pipeline now calls profile_enrichment.inference directly)
+# ---------------------------------------------------------------------------------------------
+
+_legacy_state = threading.local()
 
 
 def consume_ai_call_failure() -> str:
-    """Return (and clear) the last Qwen endpoint error seen on this thread, or ''."""
-    error = getattr(_ai_call_state, "error", "")
-    _ai_call_state.error = ""
+    """Legacy: error text of the last :func:`run_ai_extraction` call on this thread (use ExtractionResult instead)."""
+    error = getattr(_legacy_state, "error", "")
+    _legacy_state.error = ""
     return error
 
 
-def _run_openai_compatible_extraction(base_url: str, api_key: str, model: str, text: str) -> Dict[str, Any]:
-    # "OpenAI-compatible" is only the wire protocol: base_url is the local Qwen server
-    # (LOCAL_MODEL_BASE_URL, e.g. Ollama). No request ever goes to OpenAI.
-    _ai_call_state.error = ""
-    client = _get_openai_client(base_url=base_url, api_key=api_key, timeout=CONFIG["ai_request_timeout"])
-    prompt = _build_extraction_prompt(text)
-
-    try:
-        response = client.chat.completions.create(
-            model=model,
-            messages=[
-                {"role": "system", "content": EXTRACTION_SYSTEM_PROMPT},
-                {"role": "user", "content": prompt},
-            ],
-            temperature=0,
-            max_tokens=CONFIG["local_model_max_tokens"],
-        )
-    except Exception as exc:
-        _ai_call_state.error = f"{type(exc).__name__}: {exc}"
-        logger.warning(f"Qwen endpoint error ({base_url}, model={model}): {exc}")
-        return {}
-
-    content = response.choices[0].message.content or "{}"
-    try:
-        data = _first_json_object(content)
-    except json.JSONDecodeError:
-        return {}
-    return {k: v for k, v in data.items() if v not in (None, "", " ")}
-
-
-@lru_cache(maxsize=1)
-def _load_local_qwen():
-    from llama_cpp import Llama
-
-    model_path = CONFIG["local_model_path"]
-    if model_path and os.path.exists(model_path):
-        return Llama(
-            model_path=model_path,
-            n_ctx=CONFIG["local_model_n_ctx"],
-            verbose=False,
-        )
-
-    if not CONFIG["local_model_enabled"]:
-        raise ValueError("LOCAL_MODEL_ENABLED is false and LOCAL_MODEL_PATH is unavailable")
-
-    return Llama.from_pretrained(
-        repo_id=CONFIG["local_model_repo_id"],
-        filename=CONFIG["local_model_filename"],
-        local_dir=CONFIG["local_model_dir"],
-        n_ctx=CONFIG["local_model_n_ctx"],
-        verbose=False,
-    )
-
-
-def _run_local_qwen_extraction(text: str) -> Dict[str, Any]:
-    if CONFIG["local_model_base_url"]:
-        return _run_openai_compatible_extraction(
-            base_url=CONFIG["local_model_base_url"],
-            api_key=CONFIG["local_model_api_key"],
-            model=CONFIG["local_model_name"],
-            text=text,
-        )
-
-    try:
-        llm = _load_local_qwen()
-    except Exception as exc:
-        logger.warning(f"Failed to load local Qwen model: {exc}")
-        return {}
-
-    prompt = _build_extraction_prompt(text)
-
-    try:
-        response = llm.create_chat_completion(
-            messages=[
-                {"role": "system", "content": EXTRACTION_SYSTEM_PROMPT},
-                {"role": "user", "content": prompt},
-            ],
-            temperature=0,
-            max_tokens=CONFIG["local_model_max_tokens"],
-        )
-    except Exception as exc:
-        logger.warning(f"Local Qwen extraction error: {exc}")
-        return {}
-
-    content = response.get("choices", [{}])[0].get("message", {}).get("content") or "{}"
-    try:
-        data = _first_json_object(content)
-    except json.JSONDecodeError:
-        return {}
-    return {k: v for k, v in data.items() if v not in (None, "", " ")}
-
-
 def run_ai_extraction(document_path: str, text: str) -> Dict[str, Any]:
+    """Legacy dict view over :func:`inference.extract_fields`; a failure sets consume_ai_call_failure()."""
     del document_path
+    _legacy_state.error = ""
     if not CONFIG["ai_extractor_enabled"] or not text.strip():
         return {}
+    from profile_enrichment import inference
 
-    return _run_local_qwen_extraction(text)
+    result = inference.extract_fields([(1, text)])
+    if not result.succeeded:
+        _legacy_state.error = f"{result.status.value}: {result.error}"
+        return {}
+    return {c.field: c.value for c in result.candidates}
 
 
 def combine_extracted_values(base: Dict[str, Any], extra: Dict[str, Any]) -> Dict[str, Any]:
