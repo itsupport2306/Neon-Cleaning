@@ -34,6 +34,7 @@ from typing import Any, Dict, List
 
 from profile_enrichment import processor
 from profile_enrichment.config import CONFIG
+from profile_enrichment.extractors import consume_ai_call_failure, run_ai_extraction
 from profile_enrichment.neon_db import PROFILE_COLUMNS, fetch_profile_by_id, get_connection
 from profile_enrichment.state_manager import StateManager
 
@@ -142,6 +143,14 @@ def process_one(
             disable_ocr=disable_ocr,
         )
         problem = capture.pop(profile_id)
+        qwen_error = consume_ai_call_failure()
+        if qwen_error:
+            # Qwen never answered, so "no specialty found" would be a false conclusion.
+            # Mark it failed so a rerun retries it instead of treating it as finished.
+            reason = f"Qwen call failed: {qwen_error}"
+            ledger.record(profile_id, FAILED, reason)
+            logger.error("NULL_SPECIALTY_QWEN_FAILED | profile_id=%s | reason=%s", profile_id, reason)
+            return FAILED
         if outcome in ("failed", "invalid"):
             ledger.record(profile_id, FAILED, problem or f"processor returned {outcome}")
             return FAILED
@@ -157,7 +166,8 @@ def process_one(
             logger.info("NULL_SPECIALTY_RESOLVED | profile_id=%s | specialty=%s | updated_fields=%s", profile_id, after.get("specialty"), changed)
             return RESOLVED
 
-        reason = problem or "no verified specialty found in the resume"
+        # `problem` is the last unrelated warning (e.g. a rejected state), so it is not the reason.
+        reason = "Qwen and regex found no specialty that is verifiably present in the resume"
         ledger.record(profile_id, UNRESOLVED, reason, changed)
         logger.warning("NULL_SPECIALTY_UNRESOLVED | profile_id=%s | reason=%s | updated_fields=%s", profile_id, reason, changed)
         return UNRESOLVED
@@ -223,7 +233,18 @@ def print_report(report: Dict[str, Any], json_path: Path, csv_path: Path) -> Non
     print(f"Unresolved/failed CSV    : {csv_path}")
 
 
+def check_qwen_reachable() -> None:
+    """Stop before touching 100k+ rows if the Qwen endpoint is down."""
+    if not CONFIG["ai_extractor_enabled"]:
+        raise SystemExit("AI_EXTRACTOR_ENABLED is false; this run needs Qwen.")
+    run_ai_extraction(None, "Jane Smith, MD. Cardiology. Dallas, TX.")
+    error = consume_ai_call_failure()
+    if error:
+        raise SystemExit(f"Qwen is not reachable at {CONFIG['local_model_base_url']}: {error}")
+
+
 def run(workers: int, disable_ocr: bool, fresh: bool, retry_failed: bool) -> Dict[str, Any]:
+    check_qwen_reachable()
     ids = fetch_null_specialty_ids()
     missing_id_rows = sum(1 for pid in ids if pid is None)
     real_ids = [pid for pid in ids if pid]
@@ -265,7 +286,7 @@ def run(workers: int, disable_ocr: bool, fresh: bool, retry_failed: bool) -> Dic
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Fill every profile with specialty IS NULL using Qwen.")
-    parser.add_argument("--workers", type=int, default=CONFIG["worker_count"], help="Concurrent workers.")
+    parser.add_argument("--workers", type=int, default=CONFIG["worker_count"], help="Concurrent workers (a single local Qwen server usually serves 1-2 well).")
     parser.add_argument("--no-ocr", action="store_true", help="Skip OCR; use native text and Qwen only.")
     parser.add_argument("--fresh", action="store_true", help="Ignore the saved run ledger and process every ID again.")
     parser.add_argument("--no-retry-failed", action="store_true", help="On resume, do not retry IDs that previously failed.")

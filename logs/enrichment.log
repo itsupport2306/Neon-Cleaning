@@ -737,3 +737,46 @@ PermissionError: [WinError 5] Access is denied
 2026-10-23 22:05:50 | INFO | FIELD_ADDED | profile_id=p-1 | field=city | value=Austin
 2026-10-23 22:05:50 | INFO | FIELD_ADDED | profile_id=p-1 | field=state_code | value=TX
 2026-10-23 22:05:50 | INFO | FIELD_ADDED | profile_id=p-1 | field=state_code | value=TX
+2026-10-26 14:23:49 | INFO | START_PROCESSING | profile_id=p-1 | file_ref=https://example.invalid/resume.pdf
+2026-10-26 14:23:49 | WARNING | REJECTED_AI_VALUE | profile_id=p-1 | field=first_name | value=John | reason=not_found_in_source
+2026-10-26 14:23:49 | WARNING | REJECTED_AI_VALUE | profile_id=p-1 | field=last_name | value=Doe | reason=placeholder_name
+2026-10-26 14:23:49 | WARNING | REJECTED_AI_VALUE | profile_id=p-1 | field=specialty | value=Cardiology | reason=not_found_in_source
+2026-10-26 14:23:49 | WARNING | REJECTED_AI_VALUE | profile_id=p-1 | field=state_code | value=NY | reason=not_found_in_source
+2026-10-26 14:23:49 | WARNING | REJECTED_AI_VALUE | profile_id=p-1 | field=email | value=johndoe@example.com | reason=placeholder_email
+2026-10-26 14:23:49 | WARNING | REJECTED_AI_VALUE | profile_id=p-1 | field=phone | value=123-456-7890 | reason=placeholder_phone
+2026-10-26 14:23:49 | WARNING | REJECTED_AI_VALUE | profile_id=p-1 | field=city | value=New York | reason=not_found_in_source
+2026-10-26 14:23:49 | INFO | FIELD_VERIFIED | profile_id=p-1 | field=first_name | value=Maria
+2026-10-26 14:23:49 | INFO | FIELD_VERIFIED | profile_id=p-1 | field=last_name | value=Armelin
+2026-10-26 14:23:49 | INFO | SUCCESSFUL_UPDATE | profile_id=p-1 | changes=screen_reason: <empty> -> AI | native_chars=84 | ocr_chars=0 | source=native
+2026-10-26 14:23:49 | INFO | START_PROCESSING | profile_id=p-1 | file_ref=https://example.invalid/resume.pdf
+2026-10-26 14:23:49 | WARNING | REJECTED_AI_VALUE | profile_id=p-1 | field=last_name | value=I'm Patrick | reason=name_looks_like_a_sentence_or_title
+2026-10-26 14:23:49 | INFO | FIELD_VERIFIED | profile_id=p-1 | field=first_name | value=Patrick
+2026-10-26 14:23:49 | INFO | FIELD_VERIFIED | profile_id=p-1 | field=last_name | value=Vrtis
+2026-10-26 14:23:49 | INFO | SUCCESSFUL_UPDATE | profile_id=p-1 | changes=screen_reason: <empty> -> AI | native_chars=99 | ocr_chars=0 | source=native
+2026-10-26 14:23:49 | INFO | START_PROCESSING | profile_id=p-1 | file_ref=https://example.invalid/resume.pdf
+2026-10-26 14:23:49 | INFO | FIELD_VERIFIED | profile_id=p-1 | field=first_name | value=Patrick
+2026-10-26 14:23:49 | INFO | FIELD_VERIFIED | profile_id=p-1 | field=last_name | value=Vrtis
+2026-10-26 14:23:49 | INFO | FIELD_ADDED | profile_id=p-1 | field=city | value=Austin
+2026-10-26 14:23:49 | INFO | FIELD_ADDED | profile_id=p-1 | field=state_code | value=TX
+2026-10-26 14:23:49 | INFO | FIELD_ADDED | profile_id=p-1 | field=phone | value=(512) 887-2043
+2026-10-26 14:23:49 | INFO | FIELD_ADDED | profile_id=p-1 | field=email | value=patrick.vrtis@stdavids.org
+2026-10-26 14:26:07 | INFO | SUCCESSFUL_UPDATE | profile_id=p-1 | changes=city: <empty> -> Austin; email: <empty> -> patrick.vrtis@stdavids.org; phone: <empty> -> (512) 887-2043; screen_reason: <empty> -> AI; state_code: <empty> -> TX | native_chars=153 | ocr_chars=0 | source=native
+2026-10-26 14:26:07 | WARNING | REJECTED_AI_VALUE | profile_id=- | field=phone | value=5551234567 | reason=placeholder_phone
+2026-10-26 14:26:07 | INFO | SPECIALTY_FIX_START | profile_id=p1 | bad_value=00, General _ General Surgery | reason=leading_digit_junk
+2026-10-26 14:26:07 | INFO | SPECIALTY_FIX_SUCCESS | profile_id=p1 | old_value=00, General _ General Surgery | new_value=General Surgery | reason=leading_digit_junk_text_repair
+2026-10-26 14:26:07 | INFO | SPECIALTY_FIX_START | profile_id=p2 | bad_value=19780 Castleberry Loop Oregon City, OR | reason=leading_digit_junk
+2026-10-26 14:26:07 | INFO | SPECIALTY_FIX_SUCCESS | profile_id=p2 | old_value=19780 Castleberry Loop Oregon City, OR | new_value=Family Medicine | reason=leading_digit_junk
+2026-10-26 14:26:07 | INFO | FIELD_KEPT | profile_id=abc-123 | field=phone | value=5550000000 | candidate=5551234567 | reason=phone_not_null
+2026-10-26 14:26:07 | INFO | FIELD_ADDED | profile_id=abc-123 | field=phone | value=5551234567
+2026-10-26 14:26:07 | INFO | START_PROCESSING | profile_id=abc-123 | file_ref=resume.pdf
+2026-10-26 14:26:07 | INFO | SUCCESSFUL_UPDATE | profile_id=abc-123 | changes=screen_reason: <empty> -> AI | native_chars=20 | ocr_chars=0 | source=native
+2026-10-26 14:26:07 | INFO | START_PROCESSING | profile_id=abc-123 | file_ref=resume.pdf
+2026-10-26 14:26:07 | INFO | SUCCESSFUL_UPDATE | profile_id=abc-123 | changes=specialty: <empty> -> ICU RN | native_chars=18 | ocr_chars=0 | source=native
+2026-10-26 14:26:07 | WARNING | REJECTED_AI_VALUE | profile_id=p-1 | field=email | value=johndoe@example.com | reason=placeholder_email
+2026-10-26 14:26:07 | INFO | FIELD_VERIFIED | profile_id=p-1 | field=first_name | value=Patrick
+2026-10-26 14:26:07 | INFO | FIELD_KEPT | profile_id=p-1 | field=last_name | value=Vrtis | candidate=Patrick | reason=existing_value_confirmed_by_source
+2026-10-26 14:26:07 | INFO | FIELD_ADDED | profile_id=p-1 | field=city | value=Austin
+2026-10-26 14:26:07 | INFO | FIELD_ADDED | profile_id=p-1 | field=specialty | value=Cardiology
+2026-10-26 14:26:07 | INFO | FIELD_ADDED | profile_id=p-1 | field=city | value=Austin
+2026-10-26 14:26:07 | INFO | FIELD_ADDED | profile_id=p-1 | field=state_code | value=TX
+2026-10-26 14:26:07 | INFO | FIELD_ADDED | profile_id=p-1 | field=state_code | value=TX

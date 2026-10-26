@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import re
+import threading
 import zipfile
 from functools import lru_cache
 from typing import Any, Dict, List, Optional
@@ -601,8 +602,23 @@ def extract_profile_fields_from_text(text: str) -> Dict[str, Any]:
     return extracted
 
 
+# Set when the Qwen endpoint call fails, so a caller can tell "the model found nothing"
+# from "the model never answered". Per thread because extraction runs in a worker pool.
+_ai_call_state = threading.local()
+
+
+def consume_ai_call_failure() -> str:
+    """Return (and clear) the last Qwen endpoint error seen on this thread, or ''."""
+    error = getattr(_ai_call_state, "error", "")
+    _ai_call_state.error = ""
+    return error
+
+
 def _run_openai_compatible_extraction(base_url: str, api_key: str, model: str, text: str) -> Dict[str, Any]:
-    client = _get_openai_client(base_url=base_url, api_key=api_key, timeout=60.0)
+    # "OpenAI-compatible" is only the wire protocol: base_url is the local Qwen server
+    # (LOCAL_MODEL_BASE_URL, e.g. Ollama). No request ever goes to OpenAI.
+    _ai_call_state.error = ""
+    client = _get_openai_client(base_url=base_url, api_key=api_key, timeout=CONFIG["ai_request_timeout"])
     prompt = _build_extraction_prompt(text)
 
     try:
@@ -616,7 +632,8 @@ def _run_openai_compatible_extraction(base_url: str, api_key: str, model: str, t
             max_tokens=CONFIG["local_model_max_tokens"],
         )
     except Exception as exc:
-        logger.warning(f"OpenAI-compatible API error: {exc}")
+        _ai_call_state.error = f"{type(exc).__name__}: {exc}"
+        logger.warning(f"Qwen endpoint error ({base_url}, model={model}): {exc}")
         return {}
 
     content = response.choices[0].message.content or "{}"

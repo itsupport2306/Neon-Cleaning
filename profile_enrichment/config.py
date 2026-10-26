@@ -76,5 +76,7 @@ CONFIG = {
     "local_model_dir": os.getenv("LOCAL_MODEL_DIR", str(ROOT_DIR / "models")),
     "local_model_n_ctx": int(os.getenv("LOCAL_MODEL_N_CTX", "8192") or 8192),
     "local_model_max_tokens": int(os.getenv("LOCAL_MODEL_MAX_TOKENS", "512") or 512),
+    # A 4B model on CPU can need well over a minute per resume (and longer when workers queue up).
+    "ai_request_timeout": float(os.getenv("AI_REQUEST_TIMEOUT", "300") or 300),
     "ai_prompt_max_chars": max(1000, int(os.getenv("AI_PROMPT_MAX_CHARS", "12000") or 12000)),
 }
