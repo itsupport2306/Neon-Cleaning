@@ -36,6 +36,8 @@ CONFIG = {
         "NEON_SPECIALTY_FIX_QUERY",
         build_specialty_fix_sql(neon_table_name),
     ),
+    # fill_null_specialty only selects rows whose screen_reason equals this (empty = no screen_reason filter).
+    "null_specialty_screen_reason": os.getenv("NULL_SPECIALTY_SCREEN_REASON", "").strip(),
     "cloudflare_public_base_url": os.getenv("CLOUDFLARE_PUBLIC_BASE_URL"),
     "cloudflare_access_key": os.getenv("CLOUDFLARE_ACCESS_KEY"),
     "cloudflare_secret_key": os.getenv("CLOUDFLARE_SECRET_KEY"),

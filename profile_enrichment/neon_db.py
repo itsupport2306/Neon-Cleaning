@@ -162,8 +162,18 @@ def _rows(cursor) -> List[Dict[str, Any]]:
 SELECTION_SQL = "SELECT * FROM {table} WHERE specialty IS NULL"
 
 
+def _selection_filter() -> Tuple[str, tuple]:
+    """WHERE clause (and its params) for the NULL-specialty set, narrowed by NULL_SPECIALTY_SCREEN_REASON if set."""
+    reason = CONFIG["null_specialty_screen_reason"]
+    if reason:
+        return 'specialty IS NULL AND "screen_reason" = %s', (reason,)
+    return "specialty IS NULL", ()
+
+
 def selection_description() -> str:
-    return SELECTION_SQL.format(table=".".join(table_parts()))
+    sql = SELECTION_SQL.format(table=".".join(table_parts()))
+    reason = CONFIG["null_specialty_screen_reason"]
+    return f"{sql} AND screen_reason = '{reason}'" if reason else sql
 
 
 def verify_profile_id_unique() -> bool:
@@ -187,7 +197,8 @@ def count_null_specialty() -> int:
     """Exact count (a full scan of a ~12M-row table: allow minutes, not the default 30 s)."""
     def run() -> int:
         with transaction(read_only=True, timeout_ms=600_000) as conn, conn.cursor() as cursor:
-            cursor.execute(f"SELECT count(*) FROM {_table_sql()} WHERE specialty IS NULL")
+            where, params = _selection_filter()
+            cursor.execute(f"SELECT count(*) FROM {_table_sql()} WHERE {where}", params)
             return int(cursor.fetchone()[0])
 
     return _retry_connection_errors(run)
@@ -209,8 +220,9 @@ def iter_null_specialty_pages(
         for offset in range(0, len(ids), 2000):
             def run(chunk=ids[offset : offset + 2000]) -> List[Dict[str, Any]]:
                 with transaction(read_only=True) as conn, conn.cursor() as cursor:
+                    where, params = _selection_filter()
                     cursor.execute(f'SELECT "profile_id", "resume_url" FROM {_table_sql()} '
-                                   f'WHERE specialty IS NULL AND "profile_id" = ANY(%s)', (chunk,))
+                                   f'WHERE {where} AND "profile_id" = ANY(%s)', params + (chunk,))
                     return _rows(cursor)
 
             page = _retry_connection_errors(run)
@@ -223,8 +235,9 @@ def iter_null_specialty_pages(
         while True:
             def run(percent=percent) -> List[Dict[str, Any]]:
                 with transaction(read_only=True, timeout_ms=120_000) as conn, conn.cursor() as cursor:
+                    where, params = _selection_filter()
                     cursor.execute(f'SELECT "profile_id", "resume_url" FROM {_table_sql()} TABLESAMPLE SYSTEM (%s) '
-                                   f"WHERE specialty IS NULL LIMIT %s", (percent, sample_size))
+                                   f"WHERE {where} LIMIT %s", (percent,) + params + (sample_size,))
                     return _rows(cursor)
 
             page = _retry_connection_errors(run)
@@ -241,7 +254,8 @@ def iter_null_specialty_pages(
             with transaction(read_only=True, timeout_ms=0) as conn:
                 cursor = conn.cursor(name="null_specialty_manifest")
                 cursor.itersize = batch_size
-                cursor.execute(f'SELECT "profile_id", "resume_url" FROM {_table_sql()} WHERE specialty IS NULL')
+                where, params = _selection_filter()
+                cursor.execute(f'SELECT "profile_id", "resume_url" FROM {_table_sql()} WHERE {where}', params)
                 while True:
                     rows = cursor.fetchmany(batch_size)
                     if not rows:

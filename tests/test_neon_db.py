@@ -209,3 +209,15 @@ def test_pool_is_bounded_and_shared(monkeypatch):
     second = neon_db._get_pool()
     assert first is second and len(created) == 1
     assert created[0][1] == 3 and created[0][3]["connect_timeout"] == neon_db.CONFIG["db_connect_timeout"]
+
+
+def test_selection_filter_adds_screen_reason_only_when_configured(monkeypatch):
+    from profile_enrichment import neon_db
+    from profile_enrichment.config import CONFIG
+
+    monkeypatch.setitem(CONFIG, "null_specialty_screen_reason", "")
+    assert neon_db._selection_filter() == ("specialty IS NULL", ())
+    monkeypatch.setitem(CONFIG, "null_specialty_screen_reason", "AI")
+    where, params = neon_db._selection_filter()
+    assert "screen_reason" in where and params == ("AI",)
+    assert neon_db.selection_description().endswith("AND screen_reason = 'AI'")
