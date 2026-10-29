@@ -116,4 +116,4 @@ CONFIG = {
 
 # Bump when the prompt, schema or the evidence rules change: cached results and "unresolved" verdicts
 # recorded under an older version become eligible for retry.
-PROMPT_VERSION = "2026-10-26.v2"
+PROMPT_VERSION = "2026-10-29.v3"

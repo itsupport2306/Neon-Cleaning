@@ -18,7 +18,9 @@ in exactly one outcome:
     pending               not attempted yet (or prepared and waiting for --apply)
 
 Commands (python -m profile_enrichment.fill_null_specialty <command>): run (default), resume, apply, status,
-preflight, export-review, apply-review, export-unresolved, rollback, refresh-vocabulary.
+preflight, export-prepared, export-review, apply-review, export-unresolved, rollback, refresh-vocabulary.
+
+Running on a Google Colab GPU: see colab/README.md.
 """
 from __future__ import annotations
 
@@ -529,7 +531,7 @@ def cmd_apply(args) -> int:
     if not args.yes:
         counts = store.outcome_counts(run_id)
         print(f"Run {run_id}: {counts['prepared']} prepared proposals would be written "
-              f"(fields: {store.prepared_field_counts(run_id)}). Re-run with --apply to write them.")
+              f"(fields: {store.prepared_field_counts(run_id)}). Re-run with --yes to write them.")
         return EXIT_OK
     pipeline = Pipeline(store, llm_mode="never", ocr_enabled=False)
     with store._tx() as conn:
@@ -617,6 +619,32 @@ def cmd_export_unresolved(args) -> int:
         for row in rows:
             writer.writerow([row["profile_id"], row["outcome"], row["reason"], row["attempts"], row["qwen_status"]])
     print(f"Wrote {len(rows)} rows to {args.out}")
+    return EXIT_OK
+
+
+def cmd_export_prepared(args) -> int:
+    """CSV of every value a dry run would write, with the evidence line it was read from (review before `apply`)."""
+    store = js.JobStore()
+    run = store.get_run(args.run_id) if args.run_id else store.latest_run()
+    if not run:
+        print("No run found.")
+        return EXIT_PREFLIGHT
+    with store._tx() as conn:
+        rows = conn.execute(
+            "SELECT profile_id, proposal_json FROM tasks WHERE run_id=? AND state=? ORDER BY profile_id",
+            (run["run_id"], js.STATE_PREPARED),
+        ).fetchall()
+    written = 0
+    with open(args.out, "w", newline="", encoding="utf-8") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(["profile_id", "field", "current_value", "proposed_value", "source", "score", "page", "evidence"])
+        for row in rows:
+            proposal = json.loads(row["proposal_json"] or "{}")
+            for name, item in (proposal.get("fields") or {}).items():
+                writer.writerow([row["profile_id"], name, item.get("old"), item.get("value"), item.get("source"),
+                                 item.get("score"), item.get("page"), item.get("evidence")])
+                written += 1
+    print(f"Wrote {written} proposed field values ({len(rows)} profiles) to {args.out}")
     return EXIT_OK
 
 
@@ -708,6 +736,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     p.add_argument("--file", required=True); p.add_argument("--apply", action="store_true")
     p = sub.add_parser("export-unresolved", help="CSV of every task that did not end verified_updated.")
     p.add_argument("--run-id"); p.add_argument("--out", required=True)
+    p = sub.add_parser("export-prepared", help="CSV of the values a dry run would write, with their evidence.")
+    p.add_argument("--run-id"); p.add_argument("--out", required=True)
     p = sub.add_parser("rollback", help="Revert a run's writes (only where the value is still what we wrote).")
     p.add_argument("--run-id", required=True); p.add_argument("--apply", action="store_true")
     sub.add_parser("refresh-vocabulary", help="Rebuild data/specialty_vocabulary.csv from the database.")
@@ -720,7 +750,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     handlers = {
         "run": cmd_run, "resume": lambda a: cmd_run(a, resume_only=True), "apply": cmd_apply, "status": cmd_status,
         "preflight": cmd_preflight, "export-review": cmd_export_review, "apply-review": cmd_apply_review,
-        "export-unresolved": cmd_export_unresolved, "rollback": cmd_rollback, "refresh-vocabulary": cmd_refresh_vocabulary,
+        "export-unresolved": cmd_export_unresolved, "export-prepared": cmd_export_prepared, "rollback": cmd_rollback, "refresh-vocabulary": cmd_refresh_vocabulary,
     }
     return handlers[args.command](args)
 

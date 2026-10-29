@@ -204,6 +204,27 @@ def test_schema_is_requested_for_exactly_the_needed_fields():
     assert "first_name" not in backend.calls[0]["user"]
 
 
+# ---- specialty shortlist ------------------------------------------------------------------------
+
+def test_prompt_lists_only_specialty_labels_found_in_that_chunk():
+    backend = ScriptedBackend(ok(specialty="Cardiology"))
+    run(backend)
+    prompt = backend.calls[0]["user"]
+    assert "Specialty labels that appear in this text:" in prompt and "Cardiology" in prompt
+    assert "Pharmacist" not in prompt  # a vocabulary label the resume does not contain is never offered
+
+    no_specialty = ScriptedBackend(ok(email="priya.ramanathan@mailbox.org"))
+    extract_fields([(1, TEXT)], ["email"], backend=no_specialty, lexicon=LEX)
+    assert "Specialty labels" not in no_specialty.calls[0]["user"]
+
+
+def test_shortlist_does_not_relax_the_evidence_gate():
+    # the model names a real vocabulary label that is absent from the resume: still rejected
+    result = run(ScriptedBackend(ok(specialty="Pharmacist")))
+    assert not [c for c in result.candidates if c.field == "specialty"]
+    assert any(r["field"] == "specialty" and r["reason"] == "value_not_in_source" for r in result.rejected)
+
+
 # ---- readiness --------------------------------------------------------------------------------
 
 def test_readiness_check_demands_a_valid_extraction_not_just_an_answer():

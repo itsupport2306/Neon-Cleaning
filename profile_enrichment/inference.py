@@ -459,21 +459,32 @@ def build_chunks(pages: Sequence[Tuple[int, str]], budget_tokens: int, overlap_t
 SYSTEM_PROMPT = (
     "You extract facts from resume text. Reply with JSON only, matching the schema. "
     "Copy each value exactly as it is written in the text. Use null whenever a value is not explicitly "
-    "written there; never guess and never invent values."
+    "written there; never guess and never invent values. Never answer with a template or sample value "
+    "(a made-up name, address, phone number or email): if the text does not contain the real value, use null."
 )
 
 FIELD_GUIDE = {
-    "first_name": "the candidate's own first name, as written at the top of the resume (not a heading, job title, employer or school)",
-    "last_name": "the candidate's own last name, as written at the top of the resume",
-    "city": "the city of the candidate's own address or location line",
+    "first_name": (
+        "the candidate's own first name, as written in the name line at the top of the resume (not a heading, "
+        "job title, employer, school, reference or supervisor)"
+    ),
+    "last_name": "the candidate's own last name, from the same name line (without credentials such as RN, MD, BSN)",
+    "city": "the city of the candidate's own address or location line (not an employer's or school's city)",
     "state_code": "the 2-letter US state code of the candidate's own location",
     "specialty": (
         "the candidate's clinical specialty or practice area, worded as in the resume (the unit, department or "
-        "discipline they practise in). Not a bare credential abbreviation, employer, school, degree, software or skill"
+        "discipline they practise in, preferring their current or most recent role). Not a bare credential "
+        "abbreviation, employer, school, degree, software or skill"
     ),
     "phone": "the candidate's own phone number (not a reference's or an employer's)",
-    "email": "the candidate's own email address",
+    "email": "the candidate's own email address (not an employer's or a reference's)",
 }
+
+# Vocabulary labels found in a chunk are offered to the model as a shortlist for the specialty. Offering them
+# changes nothing about what is accepted (verify_candidate still requires a taxonomy label found in the text);
+# it only stops the model from paraphrasing a label the resume already uses into one that fails the gate.
+MAX_SPECIALTY_OPTIONS = 15
+_SPECIALTY_OPTIONS_TOKENS = 200
 
 
 def build_schema(fields: Sequence[str]) -> Dict[str, Any]:
@@ -487,11 +498,33 @@ def build_schema(fields: Sequence[str]) -> Dict[str, Any]:
     }
 
 
-def build_user_prompt(fields: Sequence[str], chunk: Chunk, total_chunks: int) -> str:
+def specialty_options(text: str, lexicon: SpecialtyLexicon | None) -> List[str]:
+    """Distinct vocabulary labels that occur in `text`, in order of first appearance."""
+    if lexicon is None:
+        return []
+    labels: List[str] = []
+    room = int(_SPECIALTY_OPTIONS_TOKENS * CONFIG["ai_chars_per_token"]) - 200  # leave room for the instruction
+    for match in sorted(lexicon.find(text), key=lambda m: m.start):
+        if match.label in labels:
+            continue
+        room -= len(match.label) + 2
+        if room < 0 or len(labels) >= MAX_SPECIALTY_OPTIONS:
+            break
+        labels.append(match.label)
+    return labels
+
+
+def build_user_prompt(fields: Sequence[str], chunk: Chunk, total_chunks: int, options: Sequence[str] = ()) -> str:
     guide = "\n".join(f'- "{name}": {FIELD_GUIDE[name]}' for name in fields)
+    shortlist = ""
+    if options and "specialty" in fields:
+        shortlist = (
+            "\n\nSpecialty labels that appear in this text: " + "; ".join(options) + ". If one of them is the "
+            "candidate's own specialty, return it spelled exactly as listed; otherwise return null."
+        )
     return (
         f"Extract these fields from part {chunk.index + 1} of {total_chunks} of a resume "
-        f"(pages {chunk.pages[0]}-{chunk.pages[-1]}):\n{guide}\n\n"
+        f"(pages {chunk.pages[0]}-{chunk.pages[-1]}):\n{guide}{shortlist}\n\n"
         "If this part does not state a field, return null for it.\n\nRESUME TEXT:\n" + chunk.text
     )
 
@@ -503,7 +536,9 @@ def output_budget(fields: Sequence[str]) -> int:
 def input_budget(fields: Sequence[str]) -> int:
     """Largest chunk (in estimated tokens) that still fits the context together with prompt and answer."""
     overhead = estimate_tokens(SYSTEM_PROMPT) + estimate_tokens(build_user_prompt(fields, Chunk(0, "", [1], []), 1))
-    room = CONFIG["ai_context_tokens"] - output_budget(fields) - overhead - 96
+    if "specialty" in fields:
+        overhead += _SPECIALTY_OPTIONS_TOKENS
+    room =CONFIG["ai_context_tokens"] - output_budget(fields) - overhead - 96
     return max(200, min(CONFIG["ai_chunk_tokens"], room))
 
 
@@ -647,12 +682,13 @@ _sleep: Callable[[float], None] = time.sleep
 
 
 def _call_chunk(
-    backend: Backend, chunk: Chunk, total: int, fields: Sequence[str], schema: Dict[str, Any]
+    backend: Backend, chunk: Chunk, total: int, fields: Sequence[str], schema: Dict[str, Any],
+    options: Sequence[str] = (),
 ) -> Tuple[ChunkOutcome, Optional[Dict[str, Any]]]:
     outcome = ChunkOutcome(index=chunk.index, pages=chunk.pages, status="")
     max_attempts = CONFIG["ai_max_attempts"]
     max_tokens = output_budget(fields)
-    prompt = build_user_prompt(fields, chunk, total)
+    prompt = build_user_prompt(fields, chunk, total, options)
     started = time.time()
     data: Optional[Dict[str, Any]] = None
 
@@ -722,7 +758,8 @@ def extract_fields(
     proposed = 0
     failure: Optional[ChunkOutcome] = None
     for chunk in chunks[:limit]:
-        outcome, data = _call_chunk(backend, chunk, len(chunks), fields, schema)
+        options = specialty_options(chunk.text, lexicon) if "specialty" in fields else []
+        outcome, data = _call_chunk(backend, chunk, len(chunks), fields, schema, options)
         result.chunks.append(outcome)
         if data is None:
             failure = failure or outcome

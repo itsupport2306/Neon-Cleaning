@@ -1,9 +1,11 @@
 """End-to-end: selection manifest -> download -> text -> model -> validation -> guarded write -> read-back."""
 
+import csv
 import io
 import json
 import threading
 import time
+from unittest import mock
 
 import pytest
 from docx import Document
@@ -152,6 +154,14 @@ def test_dry_run_writes_nothing_then_apply_writes_and_verifies(world):
     proposal = json.loads(world.store._conn().execute("SELECT proposal_json FROM tasks").fetchone()[0])
     assert proposal["fields"]["specialty"]["value"] == "ICU" and proposal["fields"]["specialty"]["page"] == 1
     assert proposal["fields"]["specialty"]["evidence"]  # the exact source line travels with the value
+
+    out = world.store.path.parent / "prepared.csv"
+    with mock.patch.object(cli.js, "JobStore", return_value=world.store):
+        assert cli.main(["export-prepared", "--run-id", run_id, "--out", str(out)]) == cli.EXIT_OK
+    with open(out, newline="", encoding="utf-8") as handle:
+        exported = {r["field"]: r for r in csv.DictReader(handle)}
+    assert exported["specialty"]["proposed_value"] == "ICU" and exported["specialty"]["evidence"]
+    assert exported["specialty"]["current_value"] == ""  # NULL today
     calls_before = world.model.calls
 
     world.run(run_id, apply=True)  # applying prepared proposals needs no new model call
