@@ -11,3 +11,6 @@ __pycache__/
 venv/
 profile_dedup/reports/*.json
 profile_dedup/reports/*.csv
+
+# resume_collab validation output (contains candidate PII)
+resume_collab/output/
