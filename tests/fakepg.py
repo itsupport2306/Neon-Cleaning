@@ -15,7 +15,7 @@ from typing import Any, Dict, List, Optional
 import psycopg2.errors
 
 COLUMNS = ["profile_id", "first_name", "last_name", "city", "state_code", "specialty", "phone", "email",
-           "screen_reason", "resume_url", "created_at", "updated_at"]
+           "screen_reason", "resume_url", "zip_code", "created_at", "updated_at"]
 
 
 class FakeCursor:
@@ -135,7 +135,7 @@ def create_table(path: str) -> None:
         """
         CREATE TABLE profiles(
           profile_id TEXT PRIMARY KEY, first_name TEXT NOT NULL, last_name TEXT NOT NULL, city TEXT, state_code TEXT,
-          specialty TEXT, phone TEXT, email TEXT, screen_reason TEXT, resume_url TEXT, created_at TEXT, updated_at TEXT);
+          specialty TEXT, phone TEXT, email TEXT, screen_reason TEXT, resume_url TEXT, zip_code TEXT, created_at TEXT, updated_at TEXT);
         CREATE UNIQUE INDEX ux_profiles_email_ci ON profiles(lower(email)) WHERE email IS NOT NULL AND email <> '';
         """
     )

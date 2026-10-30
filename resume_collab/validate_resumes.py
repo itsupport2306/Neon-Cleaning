@@ -1,15 +1,16 @@
-"""Validate stored profile data (first name, last name, specialty, address) against the resume. READ-ONLY.
+"""Validate stored profile data (first name, last name, specialty, address) against the resume. READ-ONLY by default.
 
     SELECT ... FROM profiles WHERE specialty IS NOT NULL AND resume_url IS NOT NULL
 
-Nothing is ever written to the database: findings go to three CSV files, one row per profile_id, appended as
-each profile finishes (see resume_collab/README.md):
+Nothing is written to the database unless `run --apply-to-neon` is given: findings go to three CSV files, one row
+per profile_id, appended as each profile finishes (see resume_collab/README.md):
 
     resume_validation_discrepancies.csv     a field is explicitly contradicted by the resume
     resume_validation_no_discrepancies.csv  readable resume, nothing contradicted: for manual review
     resume_validation_errors.csv            could not be validated (download, unreadable, model, nothing verifiable)
 
-Commands (python -m resume_collab.validate_resumes <command>): count, preflight, run (default), status.
+Commands (python -m resume_collab.validate_resumes <command>): count, preflight, run (default), status,
+revert-updates. With --apply-to-neon every mismatched field is replaced with the resume's value (resume_collab/neon_writer.py).
 It reuses profile_enrichment for download, text/OCR extraction, the Qwen backend, config and the DB pool.
 """
 from __future__ import annotations
@@ -36,6 +37,7 @@ from profile_enrichment.logging_utils import setup_logger
 from profile_enrichment.specialty_lexicon import SpecialtyLexicon
 
 from resume_collab import compare as cmp
+from resume_collab import neon_writer
 from resume_collab.csv_store import (DISCREPANCY_FILE, ERROR_FILE, NO_DISCREPANCY_FILE, ResultStore,
                                      duplicates)
 
@@ -290,6 +292,8 @@ class Outcome:
     kind: str  # discrepancy | no_discrepancy | error
     row: Dict[str, Any]
     category: str = ""
+    changes: Dict[str, Any] = field(default_factory=dict)  # column -> (stored value, resume value) for --apply-to-neon
+    not_written: List[Any] = field(default_factory=list)   # (column, resume value, reason) the resume could not supply
 
 
 def _error(profile: Dict[str, Any], category: str, detail: str, retryable: bool,
@@ -332,7 +336,10 @@ def evaluate(profile: Dict[str, Any], reading: ResumeReading, text: str, lexicon
                "address_db": address.db_value, "address_resume": address.resume_value,
                "mismatched_fields": ";".join(bad), "discrepancy_reason": cmp.reasons(results, bad),
                "review_status": "pending_review", "validation_status": "discrepancy_found"}
-        return Outcome("discrepancy", row)
+        changes, not_written = neon_writer.build_corrections(
+            profile, results, reading.first_name, reading.last_name, reading.address, reading.specialties,
+            reading.profession, lexicon)
+        return Outcome("discrepancy", row, changes=changes, not_written=not_written)
     if status == "no_discrepancy":
         why = "Resume readable and no field contradicted; profile left unchanged for manual review."
         if unverified:
@@ -391,6 +398,8 @@ class Progress:
     counts: Dict[str, int] = field(default_factory=lambda: {"discrepancy": 0, "no_discrepancy": 0, "error": 0})
     skipped: int = 0
     last_print: float = 0.0
+    fields_written: int = 0
+    fields_not_written: int = 0
 
     @property
     def processed(self) -> int:
@@ -402,6 +411,8 @@ class Progress:
         text = (f"processed {self.processed} this run | discrepancy={self.counts['discrepancy']} "
                 f"no_discrepancy={self.counts['no_discrepancy']} error={self.counts['error']} | "
                 f"{rate * 60:.1f}/min")
+        if self.fields_written or self.fields_not_written:
+            text += f" | neon fields written={self.fields_written} not_written={self.fields_not_written}"
         if self.total:
             remaining = max(0, self.total - prior_done - self.processed)
             text += f" | remaining ~{remaining}" + (f" (~{remaining / rate / 3600:.1f} h)" if rate else "")
@@ -424,7 +435,11 @@ def cmd_run(args) -> int:
         if not report["ok"]:
             print_preflight(report)
             return EXIT_PREFLIGHT
-    store = ResultStore(out_dir, retry_errors=args.retry_errors)
+    store = ResultStore(out_dir, retry_errors=args.retry_errors, redo_discrepancies=args.redo_discrepancies)
+    audit = neon_writer.UpdateAudit(out_dir) if args.apply_to_neon else None
+    if audit:
+        print(f"APPLY TO NEON: mismatched fields will be replaced with the resume's values; "
+              f"old values are logged in {audit.path}", flush=True)
     prior = len(store.done)
     total: Optional[int] = None
     if not args.skip_count and not args.limit and load_ids(args) is None:
@@ -452,6 +467,18 @@ def cmd_run(args) -> int:
             except Exception as exc:  # noqa: BLE001 - one bad resume must never stop the run
                 logger.exception("UNEXPECTED_ERROR | profile_id=%s", profile["profile_id"])
                 outcome = _error(profile, "unexpected_error", f"{type(exc).__name__}: {exc}", retryable=True)
+            if audit and outcome.kind == "discrepancy":
+                for column, value, reason in outcome.not_written:
+                    audit.add(profile["profile_id"], column, profile.get(column), value, "skipped_not_writable", reason)
+                    progress.fields_not_written += 1
+                if outcome.changes:
+                    result = neon_writer.apply_corrections(profile["profile_id"], outcome.changes, audit)
+                    progress.fields_written += sum(1 for r in result.values() if r == "applied")
+                    progress.fields_not_written += sum(1 for r in result.values() if r != "applied")
+                    outcome.row["review_status"] = ("written_to_neon" if all(r == "applied" for r in result.values())
+                                                    else "partly_written_see_neon_updates_csv")
+                else:
+                    outcome.row["review_status"] = "nothing_to_write_see_neon_updates_csv"
             record = {"discrepancy": store.record_discrepancy, "no_discrepancy": store.record_no_discrepancy,
                       "error": store.record_error}[outcome.kind]
             if record(outcome.row):
@@ -551,6 +578,16 @@ def cmd_preflight(args) -> int:
     return EXIT_OK if report["ok"] else EXIT_PREFLIGHT
 
 
+def cmd_revert_updates(args) -> int:
+    """Undo `--apply-to-neon`: restore old values where the column still holds exactly what was written."""
+    path = Path(args.file) if args.file else Path(args.out_dir) / neon_writer.AUDIT_FILE
+    reverted, skipped, total = neon_writer.revert_updates(path, args.apply)
+    neon_db.close_pool()
+    print(f"{total} change(s) in {path}; reverted={reverted} skipped(already changed)={skipped}"
+          + ("" if args.apply else " (dry run; add --apply to revert)"))
+    return EXIT_OK
+
+
 def cmd_status(args) -> int:
     store = ResultStore(args.out_dir)
     counts = store.counts()
@@ -576,6 +613,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     run.add_argument("--page-size", type=int, default=2000, help="Profiles fetched per database page.")
     run.add_argument("--retry-errors", action="store_true",
                      help="Archive the errors CSV and validate those profiles again.")
+    run.add_argument("--apply-to-neon", action="store_true",
+                     help="WRITES to Neon: replace every mismatched field with the resume's value (no review). "
+                          "Old values are logged in resume_validation_neon_updates.csv.")
+    run.add_argument("--redo-discrepancies", action="store_true",
+                     help="Archive the discrepancies CSV and validate those profiles again (use with --apply-to-neon "
+                          "to apply discrepancies recorded by an earlier read-only run).")
     run.add_argument("--no-ocr", action="store_true", help="Disable OCR (scanned resumes are logged as errors).")
     run.add_argument("--skip-count", action="store_true", help="Do not count eligible rows first (faster start).")
     run.add_argument("--skip-preflight", action="store_true", help="Skip readiness checks (not recommended).")
@@ -584,12 +627,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     sub.add_parser("count", help="Count profiles with specialty IS NOT NULL AND resume_url IS NOT NULL.")
     st = sub.add_parser("status", help="Row counts of the three CSV files.")
     st.add_argument("--out-dir", default=str(default_out_dir()))
+    rv = sub.add_parser("revert-updates", help="Restore the old values written by --apply-to-neon.")
+    rv.add_argument("--out-dir", default=str(default_out_dir())); rv.add_argument("--file")
+    rv.add_argument("--apply", action="store_true", help="Actually revert (otherwise a dry run).")
 
     raw = list(sys.argv[1:] if argv is None else argv)
     if not raw or raw[0].startswith("-"):
         raw = ["run"] + raw
     args = parser.parse_args(raw)
-    return {"run": cmd_run, "preflight": cmd_preflight, "count": cmd_count, "status": cmd_status}[args.command](args)
+    return {"run": cmd_run, "preflight": cmd_preflight, "count": cmd_count, "status": cmd_status,
+            "revert-updates": cmd_revert_updates}[args.command](args)
 
 
 if __name__ == "__main__":

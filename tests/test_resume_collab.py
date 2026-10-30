@@ -187,3 +187,89 @@ def test_module_issues_only_select_statements():
         assert word not in source, f"{word!r} must not appear in the read-only validator"
     assert source.count("read_only=True") == source.count("neon_db.transaction(")
     assert "specialty IS NOT NULL AND resume_url IS NOT NULL" in vr.WHERE_ELIGIBLE
+
+
+# --- optional write-back (--apply-to-neon) ----------------------------------------------------
+
+from profile_enrichment import neon_db  # noqa: E402
+from resume_collab import neon_writer  # noqa: E402
+from tests import fakepg  # noqa: E402
+
+
+@pytest.fixture()
+def db(tmp_path, monkeypatch):
+    path = str(tmp_path / "pg.sqlite")
+    fakepg.create_table(path)
+    pool = fakepg.FakePool(path)
+    monkeypatch.setattr(neon_db, "get_connection", lambda: pool.make_lease())
+    monkeypatch.setitem(neon_db.CONFIG, "neon_table_name", "profiles")
+    return path
+
+
+def test_mismatched_fields_become_changes_and_matching_ones_do_not(pipeline):
+    outcome = pipeline({"first_name": "Maria", "city": "Dayton", "zip_code": "45402", "last_name": "Ramanathan"})
+    assert outcome.kind == "discrepancy"
+    assert outcome.changes == {"first_name": ("Maria", "Priya"), "city": ("Dayton", "Columbus"),
+                               "zip_code": ("45402", "43004")}
+    assert pipeline().changes == {}  # no discrepancy -> nothing to write
+
+
+def test_specialty_outside_the_vocabulary_is_not_written(pipeline):
+    backend = FakeBackend({"specialty_verdict": "not_supported", "specialties": ["basket weaving"]})
+    outcome = pipeline({"specialty": "Dermatology"}, backend, resume=RESUME + "Interests: basket weaving\n")
+    assert outcome.kind == "discrepancy" and "specialty" not in outcome.changes
+    assert outcome.not_written and outcome.not_written[0][0] == "specialty"
+
+
+def test_apply_writes_only_mismatched_columns_and_logs_old_values(db, tmp_path, pipeline):
+    fakepg.insert(db, profile_id="p1", first_name="Maria", last_name="Ramanathan", city="Dayton", state_code="OH",
+                  specialty="ICU", zip_code="45402", phone="111", email="a@b.org")
+    outcome = pipeline({"first_name": "Maria", "city": "Dayton", "zip_code": "45402"})
+    audit = neon_writer.UpdateAudit(tmp_path / "out")
+
+    result = neon_writer.apply_corrections("p1", outcome.changes, audit)
+
+    assert set(result.values()) == {"applied"}
+    row = fakepg.get(db, "p1")
+    assert (row["first_name"], row["city"], row["zip_code"]) == ("Priya", "Columbus", "43004")
+    assert (row["last_name"], row["specialty"], row["phone"], row["email"]) == ("Ramanathan", "ICU", "111", "a@b.org")
+    rows = list(__import__("csv").DictReader(audit.path.open(encoding="utf-8-sig")))
+    assert {(r["field"], r["old_value"], r["new_value"], r["result"]) for r in rows} >= {
+        ("first_name", "Maria", "Priya", "intended"), ("first_name", "Maria", "Priya", "applied")}
+
+
+def test_a_value_changed_by_someone_else_is_never_overwritten(db, tmp_path):
+    fakepg.insert(db, profile_id="p1", first_name="Edited", last_name="X")
+    audit = neon_writer.UpdateAudit(tmp_path)
+    result = neon_writer.apply_corrections("p1", {"first_name": ("Maria", "Priya")}, audit)  # we read 'Maria'
+    assert result == {"first_name": "skipped_changed_since_read"}
+    assert fakepg.get(db, "p1")["first_name"] == "Edited"
+
+
+def test_missing_row_and_unknown_column(db, tmp_path):
+    audit = neon_writer.UpdateAudit(tmp_path)
+    assert neon_writer.apply_corrections("nope", {"city": ("A", "B")}, audit) == {"city": "skipped_row_missing"}
+    with pytest.raises(ValueError):
+        neon_writer.apply_corrections("p1", {"email": ("a", "b")}, audit)
+
+
+def test_revert_restores_old_values_only_where_unchanged(db, tmp_path):
+    fakepg.insert(db, profile_id="p1", first_name="Maria", last_name="Ramanathan", city="Dayton")
+    audit = neon_writer.UpdateAudit(tmp_path)
+    neon_writer.apply_corrections("p1", {"first_name": ("Maria", "Priya"), "city": ("Dayton", "Columbus")}, audit)
+    fakepg.update(db, "p1", city="Elsewhere")  # someone edits the city afterwards
+
+    assert neon_writer.revert_updates(audit.path, apply=False) == (0, 0, 2)  # dry run changes nothing
+    assert fakepg.get(db, "p1")["first_name"] == "Priya"
+    reverted, skipped, _ = neon_writer.revert_updates(audit.path, apply=True)
+
+    assert (reverted, skipped) == (1, 1)
+    row = fakepg.get(db, "p1")
+    assert (row["first_name"], row["city"]) == ("Maria", "Elsewhere")
+
+
+def test_redo_discrepancies_archives_only_that_file(tmp_path):
+    store = ResultStore(tmp_path)
+    store.record_discrepancy({"profile_id": "d1"}); store.record_error({"profile_id": "e1"})
+    again = ResultStore(tmp_path, redo_discrepancies=True)
+    assert again.done == {"e1"} and list(tmp_path.glob("resume_validation_discrepancies.*.bak.csv"))

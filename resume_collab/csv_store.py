@@ -45,12 +45,14 @@ class ResultStore:
     crash between two writes, can never create a duplicate row.
     """
 
-    def __init__(self, out_dir: Path | str, retry_errors: bool = False):
+    def __init__(self, out_dir: Path | str, retry_errors: bool = False, redo_discrepancies: bool = False):
         self.dir = Path(out_dir)
         self.dir.mkdir(parents=True, exist_ok=True)
         self._lock = threading.Lock()
         if retry_errors:
             self._drop_error_rows()
+        if redo_discrepancies:
+            self._archive(DISCREPANCY_FILE, "discrepancies")
         self._done: Set[str] = set()
         for name in COLUMNS:
             self._done.update(read_ids(self.dir / name))
@@ -65,10 +67,13 @@ class ResultStore:
 
     def _drop_error_rows(self) -> None:
         """--retry-errors: archive the error file and start a new one, so those profiles are validated again."""
-        path = self.dir / ERROR_FILE
+        self._archive(ERROR_FILE, "errors")
+
+    def _archive(self, filename: str, label: str) -> None:
+        path = self.dir / filename
         if not path.exists() or path.stat().st_size == 0:
             return
-        os.replace(path, path.with_name(f"resume_validation_errors.{int(time.time())}.bak.csv"))
+        os.replace(path, path.with_name(f"resume_validation_{label}.{int(time.time())}.bak.csv"))
 
     @property
     def done(self) -> Set[str]:

@@ -175,3 +175,9 @@ edit it in the CSV. Stored values are never changed by this workflow.
 - Address validation covers city, state and ZIP only; a street found in the resume is shown in `address_resume` but never compared.
 - Speed has not been measured on a GPU for this workflow; `run` prints profiles per minute, so use the test batch to estimate the full run.
   Free Colab sessions end after about 12 h or when idle; the CSV files on Drive survive that.
+
+## Optional: write discrepancies back to Neon
+
+`run --apply-to-neon` replaces every mismatched field (first/last name, specialty, city, state, ZIP) with the resume's value, with no review step.
+Old and new values go to `resume_validation_neon_updates.csv`; `revert-updates --apply` restores them. `--redo-discrepancies` re-validates
+and applies discrepancies recorded by an earlier read-only run. Without the flag the validator never writes. See [../windows/README.md](../windows/README.md).
