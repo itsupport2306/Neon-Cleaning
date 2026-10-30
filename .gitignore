@@ -14,3 +14,11 @@ profile_dedup/reports/*.csv
 
 # resume_collab validation output (contains candidate PII)
 resume_collab/output/
+
+# local pipeline state and downloaded resumes (contain candidate PII)
+state/
+cache/
+downloads/
+models/
+*_prepared.csv
+*_unresolved.csv
